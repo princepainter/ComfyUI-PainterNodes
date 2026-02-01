@@ -10,7 +10,7 @@
 ## ✨更新动态：
  2026-2-1更新：
  
- 新增PainterS2Vplus节点：实现WAN2.2-S2V模型视频对口型功能
+ 新增PainterS2Vplus节点：实现WAN2.2-S2V模型视频对口型功能，比infinitetalk更快速度视频对口型
 
  2026-1-31更新：
  
