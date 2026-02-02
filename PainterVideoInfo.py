@@ -66,6 +66,7 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "VideoInfoSource": "🎨VideoInfoSource",
-    "VideoInfoLoaded": "🎨VideoInfoLoaded",
+    "VideoInfoSource": "VideoInfoSource",
+    "VideoInfoLoaded": "VideoInfoLoaded",
 }
+
