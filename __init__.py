@@ -204,10 +204,10 @@ except Exception as e:
     print(f"[PainterNodes] Failed to import PainterTextOverlay: {e}")
 
 try:
-    from . import MiniMaxRefToVideo
-    _register_module(MiniMaxRefToVideo)
+    from . import PainterMiniMaxRefToVideo
+    _register_module(PainterMiniMaxRefToVideo)
 except Exception as e:
-    print(f"[PainterNodes] Failed to import MiniMaxRefToVideo: {e}")
+    print(f"[PainterNodes] Failed to import PainterMiniMaxRefToVideo: {e}")
 
 try:
     from . import PainterMinimaxH3LatentUpscaler
@@ -227,6 +227,12 @@ try:
 except Exception as e:
     print(f"[PainterNodes] Failed to import PainterPromptRewriter: {e}") 
     
+try:
+    from . import PainterPreviewAny
+    _register_module(PainterPreviewAny)
+except Exception as e:
+    print(f"[PainterNodes] Failed to import PainterPreviewAny: {e}") 
+
 
 print(f"\033[92m[PainterNodes] Loaded {len(NODE_CLASS_MAPPINGS)} nodes successfully!\033[0m")
 
