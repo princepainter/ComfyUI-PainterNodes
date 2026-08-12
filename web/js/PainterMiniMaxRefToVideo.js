@@ -1442,22 +1442,21 @@ function applyNodeDataDefaults(nodeData) {
 /* ================================================================
 编辑器创建
 ================================================================ */
-// 对齐H3：彻底隐藏原始prompt widget，不占用高度
+// 隐藏原始prompt文本框，但保留极小高度占位，维持对应端口位置不变
 function hideOriginalPromptWidget(widget) {
     if (!widget) return;
     if (!widget.__mmrPromptHidden) {
         widget.__mmrPromptHidden = true;
         widget.__mmrOriginalType = widget.type;
         widget.__mmrOriginalComputeSize = widget.computeSize;
-        widget.__mmrOriginalHidden = widget.hidden;
-        widget.__mmrOriginalOptionsHidden = widget.options?.hidden;
     }
-    widget.hidden = true;
-    widget.options ||= {};
-    widget.options.hidden = true;
-    widget.options.canvasOnly = true;
-    widget.type = "hidden";
-    widget.computeSize = () => [0, -4];
+    // 保留 2px 高度占位，让外接端口停留在原行（编辑器左上角）
+    widget.hidden = false;
+    widget.type = "text";
+    widget.computeSize = () => [2, 2];
+    // 仅隐藏原输入框的视觉内容，不消除行占位
+    if (widget.inputEl) widget.inputEl.style.cssText += "opacity:0;height:0;padding:0;border:0;";
+    if (widget.element) widget.element.style.cssText += "opacity:0;height:0;overflow:hidden;";
 }
 
 function ensurePromptEditor(node) {
