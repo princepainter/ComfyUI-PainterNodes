@@ -1,9 +1,11 @@
 import { app } from "../../scripts/app.js";
 /* ================================================================
-MiniMaxRefToVideo.js  (性能修复版 + 数值连线生效修复)
-修复：上游接入width/height/length/ref_max_size数值连线不生效，被面板值覆盖问题
+PainterMiniMaxRefToVideo.js  (布局溢出修复 + 性能优化版)
+修复：1. 复制粘贴/切换工作流后编辑器溢出节点边框
+     2. 长时间使用页面卡顿、内存泄漏
+     3. 数值连线生效逻辑保留
 ================================================================ */
-const NODE_CLASS = "MiniMaxRefToVideo";
+const NODE_CLASS = "PainterMiniMaxRefToVideo";
 const PROMPT_DOC_PROP = "mmr_prompt_doc";
 const WIDGET_STATE_PROP = "mmr_widget_values";
 const NODE_SIZE_PROP = "mmr_node_size";
@@ -53,8 +55,8 @@ const MENTION_ICON_MAP = {
 };
 const MENTION_MENU_CLASS = "mmr-mention-menu";
 const MENTION_MENU_ITEM_CLASS = "mmr-mention-menu-item";
-const SIZE_STORE_THROTTLE_MS = 300;
-const SYNC_THROTTLE_MS = 120;
+const SIZE_STORE_THROTTLE_MS = 500;
+const SYNC_THROTTLE_MS = 200;
 let installed = false;
 let patchedPrompt = false;
 let activeMentionMenu = null;
@@ -83,13 +85,12 @@ function formatShotTime(totalSeconds) {
     return `${s}秒切镜`;
 }
 
-// ===== 新增：生成prompt用的 MM:SS.ff 标准时间戳 =====
 function formatShotTimestamp(totalSeconds) {
     const s = Math.max(0, Number(totalSeconds) || 0);
     const minutes = Math.floor(s / 60);
     const seconds = s % 60;
-    const mm = String(minutes).padStart(2, "0");   // 分钟补零到2位
-    const ss = seconds.toFixed(2).padStart(5, "0"); // 秒补零到2位整数+2位小数
+    const mm = String(minutes).padStart(2, "0");
+    const ss = seconds.toFixed(2).padStart(5, "0");
     return `${mm}:${ss}`;
 }
 
@@ -236,63 +237,61 @@ function cancelPendingRelayout(node) {
     relayoutThrottleMap.delete(node);
 }
 
-function forceWidgetRelayout(node) {
+// 对齐H3的节点布局修复机制，解决复制粘贴后尺寸异常
+function repairNodeLayout(node) {
     if (!node || node.__mmrRemoved) return;
-    // Coalesce bursts of calls (onNodeCreated / onConfigure / onAdded /
-    // onConnectionsChanged can all fire close together) into a single
-    // relayout cycle instead of letting overlapping cycles pile up, which
-    // is what made things get slower the longer a session ran.
     cancelPendingRelayout(node);
     const pending = {};
     relayoutThrottleMap.set(node, pending);
-    const doNudge = () => {
+
+    const doRepair = () => {
         if (!node || node.__mmrRemoved || typeof node.setSize !== "function") return;
-        const size = Array.isArray(node.size) ? node.size : null;
-        if (!size) return;
+        const size = Array.isArray(node.size) ? node.size : [...DEFAULT_NODE_SIZE];
         const w = Number(size[0]) || DEFAULT_NODE_SIZE[0];
         const h = Number(size[1]) || DEFAULT_NODE_SIZE[1];
-        // Clear any emergency clamp first so litegraph's widget layout is
-        // recomputed against the real node size, not a previously shrunk box.
+
         node.__mmrOverflowGuardClear?.();
         node.__mmrRestoringSize = true;
         try {
+            // 两次微调强制LiteGraph重新计算widget布局
             node.setSize([w, Math.max(1, h - 1)]);
             node.setSize([w, h]);
-            // Only this node needs to redraw; forcing a full-graph
-            // background redraw (setDirtyCanvas(true, true)) here is
-            // needlessly expensive and, done repeatedly, is a major source
-            // of the growing lag over long sessions.
+            node._widgetSlotsDirty = true;
+            // 仅重绘当前节点，不触发全画布重绘
             node.setDirtyCanvas?.(true, false);
         } finally {
-            node.__mmrRestoringSize = false;
+            setTimeout(() => { node.__mmrRestoringSize = false; }, 0);
         }
+        node.__mmrOverflowGuardCheck?.();
     };
+
     pending.raf1 = requestAnimationFrame(() => {
         pending.raf2 = requestAnimationFrame(() => {
             relayoutThrottleMap.delete(node);
-            doNudge();
-            node.__mmrOverflowGuardCheck?.();
-            pending.timeout = setTimeout(() => {
-                doNudge();
-                node.__mmrOverflowGuardCheck?.();
-            }, 200);
+            doRepair();
+            pending.timeout = setTimeout(doRepair, 200);
         });
     });
 }
 
+function refreshWidgetList(node) {
+    if (!Array.isArray(node?.widgets)) return;
+    const widgets = [...node.widgets];
+    try {
+        node.widgets = [];
+        node.widgets = widgets;
+    } catch { /* 部分前端widget只读 */ }
+}
+
+// 溢出防护：彻底避免ResizeObserver反馈循环
 function installOverflowGuard(node, wrap) {
     if (!node || !wrap || node.__mmrOverflowGuard) return;
-    // IMPORTANT: this guard watches `wrap` with a ResizeObserver and, when it
-    // detects overflow, writes a clamped height/width back onto `wrap`
-    // itself. Observing an element and then mutating that same element's box
-    // from inside the callback is a classic feedback-loop trap: shrinking it
-    // makes the observer fire again, which used to remove the clamp because
-    // it now looked "fine", which let it grow back and re-trigger the clamp,
-    // forever. That endless observe -> mutate -> observe cycle (each pass
-    // doing a forced layout read + a style write) is what pinned a CPU core
-    // and made the canvas get steadily more sluggish the longer a session
-    // ran. Fix: only ever clamp DOWN from here; clamps are only ever removed
-    // by an explicit relayout (clearClamp), never by this passive check.
+
+    let clampH = null;
+    let clampW = null;
+    let rafPending = false;
+    let observer = null;
+
     const applyClamp = () => {
         if (!node || node.__mmrRemoved || !wrap.isConnected) return;
         const scale = app.canvas?.ds?.scale;
@@ -302,27 +301,30 @@ function installOverflowGuard(node, wrap) {
         const nodeW = Number(size[0]) || 0;
         const nodeH = Number(size[1]) || 0;
         if (nodeW <= 0 || nodeH <= 0) return;
+
         const rect = wrap.getBoundingClientRect();
         if (!rect.width || !rect.height) return;
         const graphW = rect.width / scale;
         const graphH = rect.height / scale;
+
+        // 仅向下夹紧，且值不变时不修改DOM，避免触发观测循环
         if (graphH > nodeH - 4) {
             const safeHeight = Math.max(50, nodeH - 40);
             const px = `${(safeHeight * scale).toFixed(1)}px`;
-            if (wrap.dataset.mmrClampH !== px) {
-                wrap.dataset.mmrClampH = px;
+            if (clampH !== px) {
+                clampH = px;
                 wrap.style.setProperty("height", px, "important");
             }
         }
         if (graphW > nodeW + 4) {
             const px = `${(nodeW * scale).toFixed(1)}px`;
-            if (wrap.dataset.mmrClampW !== px) {
-                wrap.dataset.mmrClampW = px;
+            if (clampW !== px) {
+                clampW = px;
                 wrap.style.setProperty("width", px, "important");
             }
         }
     };
-    let rafPending = false;
+
     const check = () => {
         if (rafPending) return;
         rafPending = true;
@@ -331,26 +333,29 @@ function installOverflowGuard(node, wrap) {
             applyClamp();
         });
     };
+
     const clearClamp = () => {
         if (!wrap) return;
-        if (wrap.dataset.mmrClampH) {
+        if (clampH != null) {
             wrap.style.removeProperty("height");
-            delete wrap.dataset.mmrClampH;
+            clampH = null;
         }
-        if (wrap.dataset.mmrClampW) {
+        if (clampW != null) {
             wrap.style.removeProperty("width");
-            delete wrap.dataset.mmrClampW;
+            clampW = null;
         }
     };
-    let observer = null;
+
     if (typeof ResizeObserver === "function") {
         observer = new ResizeObserver(() => check());
         observer.observe(wrap);
     }
+
     node.__mmrOverflowGuard = observer;
     node.__mmrOverflowGuardCheck = check;
     node.__mmrOverflowGuardClear = clearClamp;
-    check();
+
+    // 分级延迟检测，避免初始化时尺寸不准
     [50, 150, 350, 700, 1200].forEach((delay) => {
         setTimeout(() => {
             if (!node.__mmrRemoved) check();
@@ -545,7 +550,7 @@ function removeDialogueBlock(block) {
         parent.insertBefore(marker, block);
     }
     block.remove();
-    if (after !== marker && isCaretSentinelText(after)) after.remove();
+    if (after !== marker && isOnlyCaretSentinelText(after)) after.remove();
     setCaretAtNode(marker, marker.textContent.length);
     return true;
 }
@@ -1048,6 +1053,7 @@ function syncPromptFromEditor(node, markDirty = true) {
             node.properties[PROMPT_DOC_PROP] = doc;
             validateShotChips(editor);
             if (markDirty) {
+                // 仅重绘当前节点，不触发全画布重绘
                 node.setDirtyCanvas?.(true, false);
                 app.graph?.setDirtyCanvas?.(true, false);
                 app.graph?.change?.();
@@ -1436,16 +1442,22 @@ function applyNodeDataDefaults(nodeData) {
 /* ================================================================
 编辑器创建
 ================================================================ */
+// 对齐H3：彻底隐藏原始prompt widget，不占用高度
 function hideOriginalPromptWidget(widget) {
     if (!widget) return;
     if (!widget.__mmrPromptHidden) {
         widget.__mmrPromptHidden = true;
         widget.__mmrOriginalType = widget.type;
         widget.__mmrOriginalComputeSize = widget.computeSize;
+        widget.__mmrOriginalHidden = widget.hidden;
+        widget.__mmrOriginalOptionsHidden = widget.options?.hidden;
     }
-    widget.hidden = false;
-    widget.computeSize = () => [2, 2];
-    widget.type = "text";
+    widget.hidden = true;
+    widget.options ||= {};
+    widget.options.hidden = true;
+    widget.options.canvasOnly = true;
+    widget.type = "hidden";
+    widget.computeSize = () => [0, -4];
 }
 
 function ensurePromptEditor(node) {
@@ -1465,9 +1477,11 @@ function ensurePromptEditor(node) {
         return;
     }
     hideOriginalPromptWidget(widget);
+
     const wrap = document.createElement("div");
     wrap.className = "mmr-prompt-editor-wrap";
     wrap.style.minHeight = "0px";
+
     const editor = document.createElement("div");
     editor.className = "comfy-multiline-input mmr-prompt-editor";
     editor.contentEditable = "true";
@@ -1523,6 +1537,7 @@ function ensurePromptEditor(node) {
     editor.addEventListener("compositionstart", () => {
         node.__mmrPromptComposing = true;
     });
+
     editor.addEventListener("compositionend", () => {
         node.__mmrPromptComposing = false;
         syncPromptFromEditorImmediate(node);
@@ -1662,6 +1677,7 @@ function ensurePromptEditor(node) {
     wrap.append(editor);
     node.__mmrEditor = editor;
     node.__mmrEditorWrap = wrap;
+
     installOverflowGuard(node, wrap);
     renderEditorFromNode(node);
     resetPromptHistory(node);
@@ -1675,10 +1691,13 @@ function ensurePromptEditor(node) {
         },
         margin: 10,
         serialize: false,
-        getMinHeight: () => 50,
+        getMinHeight: () => 80,
         afterResize: () => {
             throttledStoreNodeSize(node, node.size);
         },
+        onDraw: () => {
+            node.__mmrOverflowGuardCheck?.();
+        }
     });
 
     if (!domWidget) {
@@ -1692,6 +1711,7 @@ function ensurePromptEditor(node) {
     domWidget.serialize = false;
     domWidget.skip_serialize = true;
 
+    // 确保DOM控件在prompt控件之后
     const domIndex = node.widgets?.findIndex((w) => w === domWidget) ?? -1;
     const promptIndex = node.widgets?.findIndex((w) => w === widget) ?? -1;
     if (domIndex >= 0 && promptIndex >= 0 && domIndex !== promptIndex + 1) {
@@ -1701,12 +1721,12 @@ function ensurePromptEditor(node) {
     }
 
     instrumentWidgets(node);
+    refreshWidgetList(node);
     node.setDirtyCanvas?.(true, false);
 }
 
-
 /* ================================================================
-graphToPrompt 补丁（核心修复：数值连线 + 提示词连线均不被面板值覆盖）
+graphToPrompt 补丁
 ================================================================ */
 function patchGraphToPrompt() {
     if (patchedPrompt || typeof app.graphToPrompt !== "function") return;
@@ -1727,21 +1747,17 @@ function patchGraphToPrompt() {
             captureWidgetState(node);
             writeNodeSize(node, node.size);
 
-            // ===== 修复：提示词输入有连线时不覆盖 =====
+            // 提示词有连线则保留上游，无连线使用编辑器构建结果
             const promptInput = node.inputs?.find(inp => inp.name === "prompt");
             if (promptInput?.link == null) {
-                // 无连线才使用编辑器构建的运行时提示词（台词/切镜/@素材 生效）
                 promptNode.inputs.prompt = buildRuntimePrompt(node);
             }
-            // 有连线则保留原生上游引用，不做任何覆盖
 
-            // ===== 修复：数值输入有连线时不覆盖 =====
+            // 数值端口有连线则保留上游，无连线回退面板值
             const numKeys = ["width", "height", "length", "ref_max_size"];
             for (const key of numKeys) {
                 const inputDef = node.inputs?.find(inp => inp.name === key);
-                // 端口有连线，保留上游引用，不使用面板widget值
                 if (inputDef?.link != null) continue;
-                // 无连线才回退到面板值
                 const widget = getWidget(node, key);
                 if (widget && typeof widget.value !== "undefined") {
                     promptNode.inputs[key] = widget.value;
@@ -1770,6 +1786,7 @@ function installStyles() {
     box-sizing: border-box;
     padding: 0;
     overflow: hidden;
+    contain: size layout paint;
 }
 .mmr-prompt-editor {
     --mmr-text-size: 12px;
@@ -1783,7 +1800,7 @@ function installStyles() {
     box-sizing: border-box;
     padding: 4px;
     overflow-y: auto;
-    overflow-x: auto;
+    overflow-x: hidden;
     overscroll-behavior: contain;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
@@ -1820,6 +1837,8 @@ function installStyles() {
     user-select: text;
     cursor: text;
     outline: none;
+    -webkit-box-decoration-break: clone;
+    box-decoration-break: clone;
 }
 .mmr-dialogue-block::before {
     content: "💬 ";
@@ -1976,17 +1995,22 @@ function installNode(nodeType, nodeData) {
         this.__mediaDirty = true;
         ensurePromptEditor(this);
         instrumentWidgets(this);
+
         const node = this;
-        setTimeout(() => {
-            if (node.__mmrRemoved) return;
-            const storedSize = node.properties?.[NODE_SIZE_PROP];
-            if (!node.__mmrConfigured && !Array.isArray(storedSize)) {
-                applyNodeSizeNow(node, DEFAULT_NODE_SIZE);
-            } else if (Array.isArray(storedSize)) {
-                applyNodeSizeNow(node, storedSize);
-            }
-            forceWidgetRelayout(node);
-        }, 0);
+        // 多级延迟布局修复，确保复制粘贴后尺寸正确
+        [0, 50, 150, 300, 500].forEach((delay) => {
+            setTimeout(() => {
+                if (node.__mmrRemoved) return;
+                const storedSize = node.properties?.[NODE_SIZE_PROP];
+                if (!node.__mmrConfigured && !Array.isArray(storedSize)) {
+                    applyNodeSizeNow(node, DEFAULT_NODE_SIZE);
+                } else if (Array.isArray(storedSize)) {
+                    applyNodeSizeNow(node, storedSize);
+                }
+                repairNodeLayout(node);
+                refreshWidgetList(node);
+            }, delay);
+        });
         return result;
     };
 
@@ -1995,28 +2019,34 @@ function installNode(nodeType, nodeData) {
         this.__mmrConfigured = true;
         this.__mediaDirty = true;
         this.properties ||= {};
+
         const incomingState = info?.properties?.[WIDGET_STATE_PROP] ?? this.properties?.[WIDGET_STATE_PROP];
         const incomingSize = info?.properties?.[NODE_SIZE_PROP] ?? this.properties?.[NODE_SIZE_PROP] ?? (Array.isArray(info?.size) ? info.size : null);
         const result = originalConfigure?.apply(this, arguments);
+
         this.properties ||= {};
         if (incomingState) this.properties[WIDGET_STATE_PROP] = incomingState;
         if (incomingSize) this.properties[NODE_SIZE_PROP] = incomingSize;
         if (info?.properties?.[PROMPT_DOC_PROP]) {
             this.properties[PROMPT_DOC_PROP] = info.properties[PROMPT_DOC_PROP];
         }
+
         ensurePromptEditor(this);
         restoreWidgetState(this, incomingState);
         renderEditorFromNode(this);
         resetPromptHistory(this);
         instrumentWidgets(this);
-        {
-            const node = this;
+
+        const node = this;
+        // 配置恢复后强制修复布局（解决切换工作流/粘贴后溢出）
+        [0, 50, 150, 300].forEach((delay) => {
             setTimeout(() => {
                 if (node.__mmrRemoved) return;
                 if (incomingSize) applyNodeSizeNow(node, incomingSize);
-                forceWidgetRelayout(node);
-            }, 50);
-        }
+                repairNodeLayout(node);
+                refreshWidgetList(node);
+            }, delay);
+        });
         return result;
     };
 
@@ -2039,6 +2069,8 @@ function installNode(nodeType, nodeData) {
     nodeType.prototype.onRemoved = function onRemovedMMR() {
         this.__mmrRemoved = true;
         if (activeMentionMenu?.node === this) closeMentionMenu();
+
+        // 清理所有定时器
         if (this.__mmrEditorRetryTimer) {
             clearTimeout(this.__mmrEditorRetryTimer);
             this.__mmrEditorRetryTimer = null;
@@ -2049,26 +2081,33 @@ function installNode(nodeType, nodeData) {
         }
         sizeThrottleMap.delete(this);
         cancelPendingRelayout(this);
+
+        // 清理溢出观察者
         this.__mmrOverflowGuard?.disconnect?.();
         this.__mmrOverflowGuard = null;
         this.__mmrOverflowGuardCheck = null;
         this.__mmrOverflowGuardClear = null;
+
+        // 清理DOM
         this.__mmrEditorWrap?.remove?.();
         this.__mmrEditor = null;
         this.__mmrEditorWrap = null;
         this.__mmrDomWidget = null;
+
+        // 清理状态
         this.__mmrPromptHistory = null;
         this.__mmrPromptComposing = false;
         this.__mmrDialogueHashHandled = false;
         this.__mediaCache = null;
         this.__mediaDirty = false;
+
         return originalRemoved?.apply(this, arguments);
     };
 
     const originalOnAdded = nodeType.prototype.onAdded;
     nodeType.prototype.onAdded = function onAddedMMR(graph) {
         const result = originalOnAdded?.apply(this, arguments);
-        forceWidgetRelayout(this);
+        repairNodeLayout(this);
         return result;
     };
 
@@ -2095,7 +2134,7 @@ function installNode(nodeType, nodeData) {
         this.__mediaDirty = true;
         instrumentWidgets(this);
 
-        // ===== 修复：数值端口连线变化时，清理持久化缓存 =====
+        // 数值端口连线变化时清理持久化缓存
         const numKeys = ["width", "height", "length", "ref_max_size"];
         const state = this.properties?.[WIDGET_STATE_PROP];
         if (state) {
@@ -2106,9 +2145,9 @@ function installNode(nodeType, nodeData) {
                 }
             }
         }
-
         captureWidgetState(this);
-        forceWidgetRelayout(this);
+        repairNodeLayout(this);
+
         if (this.__mmrEditor && document.activeElement === this.__mmrEditor) {
             openOrUpdateMentionMenu(this, this.__mmrEditor);
         }
@@ -2120,12 +2159,14 @@ function installNode(nodeType, nodeData) {
 扩展注册
 ================================================================ */
 app.registerExtension({
-    name: "MiniMaxRefToVideo",
+    name: "PainterMiniMaxRefToVideo",
     setup() {
         if (installed) return;
         installed = true;
         patchGraphToPrompt();
         installStyles();
+
+        // 全局点击关闭提及菜单
         document.addEventListener("pointerdown", (event) => {
             if (!activeMentionMenu) return;
             if (activeMentionMenu.element.contains(event.target)) return;
