@@ -59,15 +59,15 @@ def _empty_av_latent(width, height, length, batch_size=1):
     return {"samples": comfy.nested_tensor.NestedTensor((video, audio))}, frame_count
 
 
-class MiniMaxRefToVideo(io.ComfyNode):
+class PainterMiniMaxRefToVideo(io.ComfyNode):
     """ref2va: prompt + reference images / videos / audio -> conditioning + AV latent."""
 
     @classmethod
     def define_schema(cls):
         return io.Schema(
-            node_id="MiniMaxRefToVideo",
+            node_id="PainterMiniMaxRefToVideo",
             description="Reference conditioning for MiniMax H3. Use <Picture i> / <Video k> / <Audio j> tags when prompting.",
-            display_name="MiniMax Ref To Video",
+            display_name="Painter MiniMax Ref To Video",
             category="model/conditioning/minimax",
             inputs=[
                 io.Clip.Input("clip"),
@@ -323,9 +323,9 @@ class MiniMaxRefToVideo(io.ComfyNode):
 
 
 NODE_CLASS_MAPPINGS = {
-    "MiniMaxRefToVideo": MiniMaxRefToVideo
+    "PainterMiniMaxRefToVideo": PainterMiniMaxRefToVideo
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "MiniMaxRefToVideo": "MiniMax Ref To Video"
+    "PainterMiniMaxRefToVideo": "Painter MiniMax Ref To Video"
 }
