@@ -246,9 +246,18 @@ function repairNodeLayout(node) {
 
     const doRepair = () => {
         if (!node || node.__mmrRemoved || typeof node.setSize !== "function") return;
-        const size = Array.isArray(node.size) ? node.size : [...DEFAULT_NODE_SIZE];
+        // 尺寸基准优先级：保存的 NODE_SIZE_PROP > node.size > DEFAULT_NODE_SIZE
+        // 这能防止修复过程把用户手动调整过的尺寸重置回默认值
+        const saved = node.properties?.[NODE_SIZE_PROP];
+        const savedSize = Array.isArray(saved) && saved.length >= 2 ? saved : null;
+        const current = Array.isArray(node.size) ? node.size : null;
+        const size = savedSize || current || [...DEFAULT_NODE_SIZE];
         const w = Number(size[0]) || DEFAULT_NODE_SIZE[0];
         const h = Number(size[1]) || DEFAULT_NODE_SIZE[1];
+        if (savedSize && (!current || Math.abs(current[0] - w) > 1 || Math.abs(current[1] - h) > 1)) {
+            // 当前 size 与保存的尺寸不一致（例如加载初期 node.size 仍是默认值）→ 先恢复保存尺寸
+            node.setSize([w, h]);
+        }
 
         node.__mmrOverflowGuardClear?.();
         node.__mmrRestoringSize = true;
@@ -1996,19 +2005,33 @@ function installNode(nodeType, nodeData) {
         instrumentWidgets(this);
 
         const node = this;
-        // 多级延迟布局修复，确保复制粘贴后尺寸正确
-        [0, 50, 150, 300, 500].forEach((delay) => {
-            setTimeout(() => {
+        // 尺寸恢复策略：
+        // 1) properties[NODE_SIZE_PROP] 存在（configure 时恢复的 properties）→ 加载的节点，恢复保存尺寸
+        // 2) __mmrConfigured 为 true → onConfigure 已接管恢复
+        // 3) 两者皆无 → 新添加的节点，使用默认尺寸
+        // 这确保即使 onConfigure 钩子因版本差异未被调用，也能正确恢复用户手动调整过的尺寸
+        requestAnimationFrame(() => {
+            if (node.__mmrRemoved) return;
+            const savedSize = node.properties?.[NODE_SIZE_PROP];
+            const hasSavedSize = Array.isArray(savedSize) && savedSize.length >= 2;
+            console.log("[MMR] onNodeCreated rAF", {
+                configured: !!node.__mmrConfigured,
+                hasSavedSize,
+                savedSize,
+                size: node.size,
+            });
+            if (hasSavedSize) {
+                applyNodeSizeNow(node, savedSize);
+            } else if (!node.__mmrConfigured) {
+                applyNodeSizeNow(node, DEFAULT_NODE_SIZE);
+            }
+            repairNodeLayout(node);
+            refreshWidgetList(node);
+            // 第二轮修复，确保 widget 布局稳定
+            requestAnimationFrame(() => {
                 if (node.__mmrRemoved) return;
-                const storedSize = node.properties?.[NODE_SIZE_PROP];
-                if (!node.__mmrConfigured && !Array.isArray(storedSize)) {
-                    applyNodeSizeNow(node, DEFAULT_NODE_SIZE);
-                } else if (Array.isArray(storedSize)) {
-                    applyNodeSizeNow(node, storedSize);
-                }
                 repairNodeLayout(node);
-                refreshWidgetList(node);
-            }, delay);
+            });
         });
         return result;
     };
@@ -2021,6 +2044,11 @@ function installNode(nodeType, nodeData) {
 
         const incomingState = info?.properties?.[WIDGET_STATE_PROP] ?? this.properties?.[WIDGET_STATE_PROP];
         const incomingSize = info?.properties?.[NODE_SIZE_PROP] ?? this.properties?.[NODE_SIZE_PROP] ?? (Array.isArray(info?.size) ? info.size : null);
+        console.log("[MMR] onConfigure", {
+            infoSize: info?.size,
+            propSize: info?.properties?.[NODE_SIZE_PROP],
+            incomingSize,
+        });
         const result = originalConfigure?.apply(this, arguments);
 
         this.properties ||= {};
@@ -2037,14 +2065,18 @@ function installNode(nodeType, nodeData) {
         instrumentWidgets(this);
 
         const node = this;
-        // 配置恢复后强制修复布局（解决切换工作流/粘贴后溢出）
-        [0, 50, 150, 300].forEach((delay) => {
+        // 恢复已保存的尺寸
+        requestAnimationFrame(() => {
+            if (node.__mmrRemoved) return;
+            if (incomingSize) applyNodeSizeNow(node, incomingSize);
+            repairNodeLayout(node);
+            refreshWidgetList(node);
+            // 延迟二次修复
             setTimeout(() => {
                 if (node.__mmrRemoved) return;
                 if (incomingSize) applyNodeSizeNow(node, incomingSize);
                 repairNodeLayout(node);
-                refreshWidgetList(node);
-            }, delay);
+            }, 200);
         });
         return result;
     };
@@ -2054,6 +2086,7 @@ function installNode(nodeType, nodeData) {
         if (this.__mmrEditor) syncPromptFromEditorImmediate(this, false);
         captureWidgetState(this);
         writeNodeSize(this, this.size);
+        console.log("[MMR] onSerialize", { nodeSize: this.size, propSize: this.properties?.[NODE_SIZE_PROP] });
         const result = originalSerialize?.apply(this, arguments);
         if (info) {
             info.properties ||= {};
