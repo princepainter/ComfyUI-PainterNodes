@@ -67,9 +67,42 @@ const MAX_REF_SLOTS = MAX_REF_ROWS * SLOTS_PER_ROW;
 let installed = false;
 let patchedPrompt = false;
 let activeMentionMenu = null;
-const sizeThrottleMap = new WeakMap();
+
+/* ================================================================
+与 Vue Nodes (Nodes 2.0) 兼容的通用工具
+================================================================ */
+function setWidgetOption(widget, key, value) {
+    if (!widget) return;
+    widget.options ||= {};
+    if (value === undefined) delete widget.options[key];
+    else widget.options[key] = value;
+    if (widget._state?.options) {
+        if (value === undefined) delete widget._state.options[key];
+        else widget._state.options[key] = value;
+    }
+}
+
+function isVueNodesMode() {
+    return Boolean(globalThis.LiteGraph?.vueNodesMode);
+}
+
+function refreshVueNodeWidgets(node) {
+    if (!Array.isArray(node?.widgets)) return;
+    const widgets = [...node.widgets];
+    try {
+        if (isVueNodesMode()) node.widgets = [];
+        node.widgets = widgets;
+    } catch { /* 在某些前端 widgets 是只读 */ }
+}
+
+function refreshNodeWidgetDOM(node) {
+    if (!node) return;
+    node._widgetSlotsDirty = true;
+    node.setDirtyCanvas?.(true, true);
+    app.graph?.setDirtyCanvas?.(true, true);
+}
+
 const syncThrottleMap = new WeakMap();
-const relayoutThrottleMap = new WeakMap();
 
 /* ================================================================
 工具函数
@@ -160,8 +193,18 @@ function getSourceNode(targetNode, inputIndex) {
 
 function getMediaPreview(sourceNode, type) {
     if (!sourceNode || type === "audio") return "";
+    // 视频素材 = 图片序列，imgs[0] 即第一帧；图片同理
     if (sourceNode.imgs?.[0]?.src) return sourceNode.imgs[0].src;
-    const imgWidget = sourceNode.widgets?.find(w => w.name === "image" || w.name === "video");
+    // 遍历源节点 widgets，找 img/video 元素（预览缩略图）
+    for (const w of sourceNode.widgets || []) {
+        const el = w?.element;
+        const img = el?.matches?.("img") ? el : el?.querySelector?.("img");
+        if (img?.src) return img.src;
+        const video = el?.matches?.("video") ? el : el?.querySelector?.("video");
+        if (type === "video" && video?.poster) return video.poster;
+    }
+    // 从 widget value 构造稳定 URL（图片类节点）
+    const imgWidget = sourceNode.widgets?.find(w => w.name === "image" || w.name === "video" || w.name === "file");
     const filename = typeof imgWidget?.value === "object" ? imgWidget.value.filename : imgWidget?.value;
     if (filename) return `/view?filename=${encodeURIComponent(filename)}&type=input`;
     return "";
@@ -479,153 +522,36 @@ function writeNodeSize(node, size) {
 
 function applyNodeSizeNow(node, size) {
     if (!node || !Array.isArray(size) && size?.length == null) return;
-    node.__mmrOverflowGuardClear?.();
     node.__mmrRestoringSize = true;
     try {
         node.setSize?.(size);
         writeNodeSize(node, size);
-        node.setDirtyCanvas?.(true, false);
+        node._widgetSlotsDirty = true;
+        node.setDirtyCanvas?.(true, true);
     } finally {
         setTimeout(() => { node.__mmrRestoringSize = false; }, 0);
     }
 }
 
-function cancelPendingRelayout(node) {
-    const pending = relayoutThrottleMap.get(node);
-    if (!pending) return;
-    if (pending.raf1 != null) cancelAnimationFrame(pending.raf1);
-    if (pending.raf2 != null) cancelAnimationFrame(pending.raf2);
-    if (pending.timeout != null) clearTimeout(pending.timeout);
-    relayoutThrottleMap.delete(node);
-}
-
 function repairNodeLayout(node) {
     if (!node || node.__mmrRemoved) return;
-    cancelPendingRelayout(node);
-    const pending = {};
-    relayoutThrottleMap.set(node, pending);
-
-    const doRepair = () => {
-        if (!node || node.__mmrRemoved || typeof node.setSize !== "function") return;
-        // 尺寸基准优先级：保存的 NODE_SIZE_PROP > node.size > DEFAULT_NODE_SIZE
-        // 这能防止修复过程把用户手动调整过的尺寸重置回默认值
-        const saved = node.properties?.[NODE_SIZE_PROP];
-        const savedSize = Array.isArray(saved) && saved.length >= 2 ? saved : null;
-        const current = Array.isArray(node.size) ? node.size : null;
-        const size = savedSize || current || [...DEFAULT_NODE_SIZE];
-        const w = Number(size[0]) || DEFAULT_NODE_SIZE[0];
-        const h = Number(size[1]) || DEFAULT_NODE_SIZE[1];
-        if (savedSize && (!current || Math.abs(current[0] - w) > 1 || Math.abs(current[1] - h) > 1)) {
-            // 当前 size 与保存的尺寸不一致（例如加载初期 node.size 仍是默认值）→ 先恢复保存尺寸
-            node.setSize([w, h]);
+    const run = () => {
+        if (node.__mmrRemoved) return;
+        // 用两阶段尺寸设置让 LiteGraph 重新测量并通知所有 widgets
+        const size = node.size;
+        if (Array.isArray(size) && typeof node.setSize === "function") {
+            try {
+                node.setSize([size[0], Math.max(40, size[1] - 1)]);
+                node.setSize([size[0], Math.max(40, size[1])]);
+            } catch { /* */ }
         }
-
-        node.__mmrOverflowGuardClear?.();
-        node.__mmrRestoringSize = true;
-        try {
-            node.setSize([w, Math.max(1, h - 1)]);
-            node.setSize([w, h]);
-            node._widgetSlotsDirty = true;
-            node.setDirtyCanvas?.(true, false);
-        } finally {
-            setTimeout(() => { node.__mmrRestoringSize = false; }, 0);
-        }
-        node.__mmrOverflowGuardCheck?.();
+        refreshVueNodeWidgets(node);
+        node._widgetSlotsDirty = true;
+        node.setDirtyCanvas?.(true, true);
+        app.graph?.setDirtyCanvas?.(true, true);
     };
-
-    pending.raf1 = requestAnimationFrame(() => {
-        pending.raf2 = requestAnimationFrame(() => {
-            relayoutThrottleMap.delete(node);
-            doRepair();
-            pending.timeout = setTimeout(doRepair, 200);
-        });
-    });
-}
-
-function refreshWidgetList(node) {
-    if (!Array.isArray(node?.widgets)) return;
-    const widgets = [...node.widgets];
-    try {
-        node.widgets = [];
-        node.widgets = widgets;
-    } catch { /* */ }
-}
-
-function installOverflowGuard(node, wrap) {
-    if (!node || !wrap || node.__mmrOverflowGuard) return;
-
-    let clampH = null;
-    let clampW = null;
-    let rafPending = false;
-    let observer = null;
-
-    const applyClamp = () => {
-        if (!node || node.__mmrRemoved || !wrap.isConnected) return;
-        const scale = app.canvas?.ds?.scale;
-        if (!scale) return;
-        const size = Array.isArray(node.size) ? node.size : null;
-        if (!size) return;
-        const nodeW = Number(size[0]) || 0;
-        const nodeH = Number(size[1]) || 0;
-        if (nodeW <= 0 || nodeH <= 0) return;
-
-        const rect = wrap.getBoundingClientRect();
-        if (!rect.width || !rect.height) return;
-        const graphW = rect.width / scale;
-        const graphH = rect.height / scale;
-
-        if (graphH > nodeH - 4) {
-            const safeHeight = Math.max(50, nodeH - 40);
-            const px = `${(safeHeight * scale).toFixed(1)}px`;
-            if (clampH !== px) {
-                clampH = px;
-                wrap.style.setProperty("height", px, "important");
-            }
-        }
-        if (graphW > nodeW + 4) {
-            const px = `${(nodeW * scale).toFixed(1)}px`;
-            if (clampW !== px) {
-                clampW = px;
-                wrap.style.setProperty("width", px, "important");
-            }
-        }
-    };
-
-    const check = () => {
-        if (rafPending) return;
-        rafPending = true;
-        requestAnimationFrame(() => {
-            rafPending = false;
-            applyClamp();
-        });
-    };
-
-    const clearClamp = () => {
-        if (!wrap) return;
-        if (clampH != null) {
-            wrap.style.removeProperty("height");
-            clampH = null;
-        }
-        if (clampW != null) {
-            wrap.style.removeProperty("width");
-            clampW = null;
-        }
-    };
-
-    if (typeof ResizeObserver === "function") {
-        observer = new ResizeObserver(() => check());
-        observer.observe(wrap);
-    }
-
-    node.__mmrOverflowGuard = observer;
-    node.__mmrOverflowGuardCheck = check;
-    node.__mmrOverflowGuardClear = clearClamp;
-
-    [50, 150, 350, 700, 1200].forEach((delay) => {
-        setTimeout(() => {
-            if (!node.__mmrRemoved) check();
-        }, delay);
-    });
+    if (typeof requestAnimationFrame === "function") requestAnimationFrame(run);
+    else setTimeout(run, 0);
 }
 
 /* ================================================================
@@ -1279,6 +1205,9 @@ function renderEditorFromNode(node, force = false) {
         appendPromptTextWithDialogueBlocks(editor, String(widget.value || ""));
         return;
     }
+    // 预先获取媒体列表（含上传参考图缩略图 URL 与外部连线源节点），
+    // 用于在重建 chip 时恢复缩略图（否则刷新后缩略图会丢失变成 emoji）。
+    const media = getConnectedMedia(node);
     for (const part of doc.parts) {
         if (part?.type === "dialogue") {
             appendDialogueBlock(editor, String(part.text || ""));
@@ -1289,18 +1218,36 @@ function renderEditorFromNode(node, force = false) {
             continue;
         }
         if (part?.type === "mention") {
+            const mediaType = part.mediaType || "image";
+            const ordinal = Number(part.ordinal);
+            const matched = media[mediaType]?.find(item => item.ordinal === ordinal);
             editor.append(makeMentionChip({
-                type: part.mediaType || "image",
-                ordinal: part.ordinal,
+                type: mediaType,
+                ordinal,
                 tag: part.token || "",
                 token: part.token || "",
                 label: part.label || "",
+                sourceNode: matched?.sourceNode,
+                previewUrl: matched?.previewUrl,
             }));
             continue;
         }
         appendTextWithBreaks(editor, part?.text || "");
     }
     validateShotChips(editor);
+}
+
+// 延迟刷新缩略图：刷新页面后源节点（图片序列/视频）的 imgs 是异步加载的，
+// 首次渲染时可能还没就绪。分多档延迟重渲染，等 imgs 加载完后恢复第一帧缩略图。
+function scheduleThumbnailRefresh(node, delays = [250, 800, 1600]) {
+    if (!node || node.__mmrRemoved) return;
+    for (const delay of delays) {
+        setTimeout(() => {
+            if (node.__mmrRemoved) return;
+            if (document.activeElement === node.__mmrEditor) return;
+            renderEditorFromNode(node, true);
+        }, delay);
+    }
 }
 
 function syncPromptFromEditor(node, markDirty = true) {
@@ -1696,6 +1643,8 @@ function hideRefImageFilesWidget(node) {
         w.__mmrHidden = true;
         w.hidden = true;
         w.computeSize = () => [0, -4];
+        setWidgetOption(w, "hidden", true);
+        setWidgetOption(w, "canvasOnly", true);
         // 不设置 serialize=false，确保 widget 值仍能被 ComfyUI 包含在 prompt 中
         if (w.inputEl) w.inputEl.style.cssText += "display:none;";
         if (w.element) w.element.style.cssText += "display:none;";
@@ -1704,6 +1653,14 @@ function hideRefImageFilesWidget(node) {
     if (idx != null && idx >= 0) {
         node.removeInput(idx);
     }
+}
+
+function showRefImageFilesWidget(widget) {
+    if (!widget?.__mmrHidden) return;
+    widget.hidden = false;
+    setWidgetOption(widget, "hidden", false);
+    setWidgetOption(widget, "canvasOnly", false);
+    widget.__mmrHidden = false;
 }
 
 /* ================================================================
@@ -1716,11 +1673,23 @@ function hideOriginalPromptWidget(widget) {
         widget.__mmrOriginalType = widget.type;
         widget.__mmrOriginalComputeSize = widget.computeSize;
     }
-    widget.hidden = false;
+    widget.hidden = true;
+    setWidgetOption(widget, "hidden", true);
+    setWidgetOption(widget, "canvasOnly", true);
     widget.type = "text";
-    widget.computeSize = () => [2, 2];
-    if (widget.inputEl) widget.inputEl.style.cssText += "opacity:0;height:0;padding:0;border:0;";
-    if (widget.element) widget.element.style.cssText += "opacity:0;height:0;overflow:hidden;";
+    widget.computeSize = () => [0, -4];
+    if (widget.inputEl) widget.inputEl.style.cssText += "display:none;";
+    if (widget.element) widget.element.style.cssText += "display:none;";
+}
+
+function restoreOriginalPromptWidget(widget) {
+    if (!widget?.__mmrPromptHidden) return;
+    widget.type = widget.__mmrOriginalType || "text";
+    widget.computeSize = widget.__mmrOriginalComputeSize || (() => [220, 120]);
+    widget.hidden = false;
+    setWidgetOption(widget, "hidden", false);
+    setWidgetOption(widget, "canvasOnly", false);
+    widget.__mmrPromptHidden = false;
 }
 
 function ensurePromptEditor(node) {
@@ -1952,7 +1921,6 @@ function ensurePromptEditor(node) {
     node.__mmrEditor = editor;
     node.__mmrEditorWrap = wrap;
 
-    installOverflowGuard(node, wrap);
     renderRefUploadArea(node);
     renderEditorFromNode(node);
     resetPromptHistory(node);
@@ -1966,12 +1934,14 @@ function ensurePromptEditor(node) {
         },
         margin: 10,
         serialize: false,
-        getMinHeight: () => 80,
+        getMinHeight: () => 50,
         afterResize: () => {
-            writeNodeSize(node, node.size);
+            node._widgetSlotsDirty = true;
+            node.setDirtyCanvas?.(true, true);
         },
         onDraw: () => {
-            node.__mmrOverflowGuardCheck?.();
+            // 仅触发重绘，让 LiteGraph 自己同步 wrap 尺寸，不再用 !important 强制干预
+            node.setDirtyCanvas?.(true, false);
         }
     });
 
@@ -1985,6 +1955,8 @@ function ensurePromptEditor(node) {
     node.__mmrDomWidget = domWidget;
     domWidget.serialize = false;
     domWidget.skip_serialize = true;
+    setWidgetOption(domWidget, "serialize", false);
+    setWidgetOption(domWidget, "canvasOnly", false);
 
     const domIndex = node.widgets?.findIndex((w) => w === domWidget) ?? -1;
     const promptIndex = node.widgets?.findIndex((w) => w === widget) ?? -1;
@@ -1995,8 +1967,10 @@ function ensurePromptEditor(node) {
     }
 
     instrumentWidgets(node);
-    refreshWidgetList(node);
-    node.setDirtyCanvas?.(true, false);
+    refreshVueNodeWidgets(node);
+    node._widgetSlotsDirty = true;
+    node.setDirtyCanvas?.(true, true);
+    app.graph?.setDirtyCanvas?.(true, true);
 }
 
 /* ================================================================
@@ -2026,19 +2000,11 @@ function patchGraphToPrompt() {
             const refFilesJson = JSON.stringify(refFiles.filter(f => f?.filename));
             promptNode.inputs.ref_image_files = refFilesJson;
 
-            // 调试日志：帮助诊断参考图是否正确注入
-            console.log("[MMR2] patchGraphToPrompt node#" + node.id, {
-                refFilesCount: refFiles.filter(f => f?.filename).length,
-                refFilesJson: refFilesJson,
-                hasEditor: !!node.__mmrEditor,
-            });
-
             // 提示词有连线则保留上游，无连线使用编辑器构建结果
             const promptInput = node.inputs?.find(inp => inp.name === "prompt");
             if (promptInput?.link == null) {
                 const builtPrompt = buildRuntimePrompt(node);
                 promptNode.inputs.prompt = builtPrompt;
-                console.log("[MMR2] builtPrompt node#" + node.id, builtPrompt);
             }
 
             // 数值端口有连线则保留上游，无连线回退面板值
@@ -2076,8 +2042,10 @@ function installStyles() {
     max-height: 100%;
     box-sizing: border-box;
     padding: 0;
+    border: 0;
     overflow: hidden;
-    contain: size layout paint;
+    pointer-events: auto;
+    z-index: 0;
 }
 .mmr-prompt-editor {
     --mmr-text-size: 12px;
@@ -2412,24 +2380,19 @@ function installNode(nodeType, nodeData) {
         // 1) properties[NODE_SIZE_PROP] 存在（configure 时恢复的 properties）→ 加载的节点，恢复保存尺寸
         // 2) __mmrConfigured 为 true → onConfigure 已接管恢复
         // 3) 两者皆无 → 新添加的节点，使用默认尺寸
-        // 这确保即使 onConfigure 钩子因版本差异未被调用，也能正确恢复用户手动调整过的尺寸
         requestAnimationFrame(() => {
             if (node.__mmrRemoved) return;
             const savedSize = node.properties?.[NODE_SIZE_PROP];
             const hasSavedSize = Array.isArray(savedSize) && savedSize.length >= 2;
-            console.log("[MMR2] onNodeCreated rAF", {
-                configured: !!node.__mmrConfigured,
-                hasSavedSize,
-                savedSize,
-                size: node.size,
-            });
             if (hasSavedSize) {
                 applyNodeSizeNow(node, savedSize);
             } else if (!node.__mmrConfigured) {
                 applyNodeSizeNow(node, DEFAULT_NODE_SIZE);
             }
             repairNodeLayout(node);
-            refreshWidgetList(node);
+            refreshVueNodeWidgets(node);
+            // 延迟恢复缩略图（等待源节点 imgs 异步加载）
+            scheduleThumbnailRefresh(node);
             // 第二轮修复，确保 widget 布局稳定
             requestAnimationFrame(() => {
                 if (node.__mmrRemoved) return;
@@ -2447,11 +2410,6 @@ function installNode(nodeType, nodeData) {
 
         const incomingState = info?.properties?.[WIDGET_STATE_PROP];
         const incomingSize = info?.properties?.[NODE_SIZE_PROP] ?? (Array.isArray(info?.size) ? info.size : null);
-        console.log("[MMR2] onConfigure", {
-            infoSize: info?.size,
-            propSize: info?.properties?.[NODE_SIZE_PROP],
-            incomingSize,
-        });
         const incomingRefFiles = info?.properties?.[REF_IMAGE_FILES_PROP];
         const incomingRefRows = info?.properties?.[REF_ROWS_PROP];
         const result = originalConfigure?.apply(this, arguments);
@@ -2479,7 +2437,9 @@ function installNode(nodeType, nodeData) {
             if (node.__mmrRemoved) return;
             if (incomingSize) applyNodeSizeNow(node, incomingSize);
             repairNodeLayout(node);
-            refreshWidgetList(node);
+            refreshVueNodeWidgets(node);
+            // 延迟恢复缩略图（等待源节点 imgs 异步加载）
+            scheduleThumbnailRefresh(node);
             // 延迟二次修复
             setTimeout(() => {
                 if (node.__mmrRemoved) return;
@@ -2495,7 +2455,6 @@ function installNode(nodeType, nodeData) {
         if (this.__mmrEditor) syncPromptFromEditorImmediate(this, false);
         captureWidgetState(this);
         writeNodeSize(this, this.size);
-        console.log("[MMR2] onSerialize", { nodeSize: this.size, propSize: this.properties?.[NODE_SIZE_PROP] });
         const result = originalSerialize?.apply(this, arguments);
         if (info) {
             info.properties ||= {};
@@ -2521,12 +2480,6 @@ function installNode(nodeType, nodeData) {
             clearTimeout(syncThrottleMap.get(this));
             syncThrottleMap.delete(this);
         }
-        cancelPendingRelayout(this);
-
-        this.__mmrOverflowGuard?.disconnect?.();
-        this.__mmrOverflowGuard = null;
-        this.__mmrOverflowGuardCheck = null;
-        this.__mmrOverflowGuardClear = null;
 
         this.__mmrEditorWrap?.remove?.();
         this.__mmrEditor = null;
@@ -2554,10 +2507,11 @@ function installNode(nodeType, nodeData) {
     const originalOnResize = nodeType.prototype.onResize;
     nodeType.prototype.onResize = function onResizeMMR(size) {
         const result = originalOnResize?.apply(this, arguments);
-        this.__mmrOverflowGuardCheck?.();
         if (!this.__mmrRestoringSize) {
             writeNodeSize(this, size || this.size);
         }
+        // 触发 widgets 重排（特别是 Vue Nodes 模式需要）
+        refreshVueNodeWidgets(this);
         return result;
     };
 
@@ -2570,10 +2524,13 @@ function installNode(nodeType, nodeData) {
         return result;
     };
 
-    const originalConnectionsChanged = nodeType.prototype.onConnectionsChanged;
-    nodeType.prototype.onConnectionsChanged = function onConnectionsChangedMMR(...args) {
-        const result = originalConnectionsChanged?.apply(this, args);
+    // 注意：LiteGraph 的标准连线变化钩子是 onConnectionsChange（单数），
+    // 之前误写成 onConnectionsChanged（复数）导致连线后媒体缓存从不失效。
+    const originalConnectionsChange = nodeType.prototype.onConnectionsChange;
+    nodeType.prototype.onConnectionsChange = function onConnectionsChangeMMR(...args) {
+        const result = originalConnectionsChange?.apply(this, args);
         this.__mediaDirty = true;
+        this.__mediaCache = null;
         instrumentWidgets(this);
 
         const numKeys = ["width", "height", "length", "ref_max_size"];
