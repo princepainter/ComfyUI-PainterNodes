@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-painternodes"
 description = "Video and image generation nodes for MiniMax H3, LTX, Wan2.2, Bernini, qwen image edit,flux image edit, and utility nodes."
-version = "1.3.5"
+version = "1.3.6"
 license = { file = "LICENSE" }
 dependencies = ["soundfile>=0.12.1", "numpy>=1.21.0"]
 
