@@ -215,6 +215,15 @@ try:
 except Exception as e:
     print(f"[PainterNodes] Failed to import PainterMiniMaxRefToVideo2: {e}")
 
+
+try:
+    from . import PainterMiniMaxToVideo
+    _register_module(PainterMiniMaxToVideo)
+except Exception as e:
+    print(f"[PainterNodes] Failed to import PainterMiniMaxToVideo: {e}")
+
+
+
 try:
     from . import PainterMiniMaxFL2VA
     _register_module(PainterMiniMaxFL2VA)
