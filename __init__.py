@@ -235,11 +235,7 @@ try:
 except Exception as e:
     print(f"[PainterNodes] Failed to import PainterPromptRewriter: {e}") 
     
-try:
-    from . import PainterPreviewAny
-    _register_module(PainterPreviewAny)
-except Exception as e:
-    print(f"[PainterNodes] Failed to import PainterPreviewAny: {e}") 
+
 
 
 print(f"\033[92m[PainterNodes] Loaded {len(NODE_CLASS_MAPPINGS)} nodes successfully!\033[0m")
