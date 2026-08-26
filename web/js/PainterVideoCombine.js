@@ -45,12 +45,20 @@ app.registerExtension({
             return getHeaderAndWidgetHeight(node);
         }
 
-        function findVideoElement(node) {
+        function getFormatValue(node) {
+            const w = node.widgets?.find((w) => w.name === "format");
+            return w?.value || "video/h264-mp4";
+        }
+
+        function findMediaElement(node) {
+            if (node.painter_media_element) return node.painter_media_element;
             if (!node.widgets) return null;
             for (const w of node.widgets) {
-                if (w.element?.tagName === "VIDEO") return w.element;
-                const vid = w.element?.querySelector("video");
-                if (vid) return vid;
+                const el = w.element;
+                if (!el) continue;
+                if (el.tagName === "VIDEO" || el.tagName === "IMG") return el;
+                const m = el.querySelector?.("video, img");
+                if (m) return m;
             }
             return null;
         }
@@ -58,7 +66,8 @@ app.registerExtension({
         const getExtraMenuOptions = nodeType.prototype.getExtraMenuOptions;
         nodeType.prototype.getExtraMenuOptions = function (_, options) {
             getExtraMenuOptions?.apply(this, arguments);
-            const video = findVideoElement(this);
+            const media = findMediaElement(this);
+            const isVideo = media?.tagName === "VIDEO";
             const newOptions = [];
 
             newOptions.push({
@@ -75,18 +84,39 @@ app.registerExtension({
             });
 
             newOptions.push({
-                content: (video && video.paused) ? "Resume preview" : "Pause preview",
-                callback: () => { if (video) video.paused ? video.play() : video.pause(); }
+                content: (isVideo && media?.paused) ? "Resume preview" : "Pause preview",
+                callback: () => {
+                    if (isVideo && media) media.paused ? media.play() : media.pause();
+                }
             });
 
             newOptions.push({
                 content: "Sync preview",
                 callback: () => {
-                    if (video) {
-                        video.pause();
-                        video.currentTime = 0;
-                        video.load();
-                        video.play();
+                    // Sync playback across EVERY PainterVideoCombine node in the workflow.
+                    // - <video>: rewind to start, replay.
+                    // - <img>  (animated gif/webp): cache-bust the src so the animation restarts.
+                    const graph = this.graph || app.canvas?.graph || app.graph;
+                    const allNodes = graph?._nodes || [];
+                    for (const n of allNodes) {
+                        if (n.type !== "PainterVideoCombine") continue;
+                        const m = n.painter_media_element || findMediaElement(n);
+                        if (!m) continue;
+                        if (m.tagName === "IMG") {
+                            const src = m.src;
+                            const sep = src && src.indexOf("?") >= 0 ? "&" : "?";
+                            m.src = (src || "") + sep + "_ts=" + Date.now();
+                        } else {
+                            try {
+                                m.pause();
+                                m.currentTime = 0;
+                                m.load();
+                                const p = m.play();
+                                if (p && typeof p.catch === "function") p.catch(() => {});
+                            } catch (e) {
+                                // best-effort; some browsers may briefly reject autoplay
+                            }
+                        }
                     }
                 }
             });
@@ -350,20 +380,9 @@ app.registerExtension({
             }
 
             const url = api.apiURL(`/view?filename=${data.filename}&subfolder=${data.subfolder}&type=${data.type}`);
+            const format = getFormatValue(node);
+            const isAnimatedImage = typeof format === "string" && format.split("/")[0] === "image";
             widget.element.innerHTML = "";
-
-            const video = document.createElement("video");
-            video.src = url;
-            video.controls = false;
-            video.loop = true;
-            video.autoplay = true;
-            video.muted = true;
-            video.preload = "metadata";
-
-            video.style.width = "100%";
-            video.style.height = "100%";
-            video.style.objectFit = "cover";
-            video.style.display = "block";
 
             const triggerCtx = (e) => {
                 e.preventDefault(); e.stopPropagation();
@@ -371,29 +390,78 @@ app.registerExtension({
                 else app.canvas._mousedown_callback(e);
                 return false;
             };
-            video.addEventListener('contextmenu', triggerCtx, true);
-            video.addEventListener('pointerdown', (e) => { if (e.button === 2) triggerCtx(e); }, true);
 
-            video.addEventListener('mouseenter', () => { video.muted = false; });
-            video.addEventListener('mouseleave', () => { video.muted = true; });
+            if (isAnimatedImage) {
+                // Animated images (gif/webp) are not playable in <video>;
+                // use <img> and let the browser animate natively.
+                const img = document.createElement("img");
+                img.src = url;
+                img.style.width = "100%";
+                img.style.height = "100%";
+                img.style.objectFit = "cover";
+                img.style.display = "block";
 
-            video.onloadedmetadata = () => {
-                if (video.videoWidth && video.videoHeight) {
-                    node.painter_aspect = video.videoWidth / video.videoHeight;
-                    const applyResize = () => {
-                        node.onResize(node.size);
-                        node.setDirtyCanvas(true, true);
-                    };
-                    applyResize();
-                    setTimeout(applyResize, 60);
-                    setTimeout(applyResize, 250);
-                }
-            };
+                img.addEventListener('contextmenu', triggerCtx, true);
+                img.addEventListener('pointerdown', (e) => { if (e.button === 2) triggerCtx(e); }, true);
 
-            widget.element.appendChild(video);
+                img.onload = () => {
+                    if (img.naturalWidth && img.naturalHeight) {
+                        node.painter_aspect = img.naturalWidth / img.naturalHeight;
+                        const applyResize = () => {
+                            node.onResize(node.size);
+                            node.setDirtyCanvas(true, true);
+                        };
+                        applyResize();
+                        setTimeout(applyResize, 60);
+                        setTimeout(applyResize, 250);
+                    }
+                };
 
-            // Create custom controls overlay
-            createCustomControls(video, widget.element);
+                widget.element.appendChild(img);
+                node.painter_media_element = img;
+                node.painter_media_kind = "img";
+            } else {
+                // Video: keep the existing custom-controls behavior unchanged.
+                const video = document.createElement("video");
+                video.src = url;
+                video.controls = false;
+                video.loop = true;
+                video.autoplay = true;
+                video.muted = true;
+                video.preload = "metadata";
+
+                video.style.width = "100%";
+                video.style.height = "100%";
+                video.style.objectFit = "cover";
+                video.style.display = "block";
+
+                video.addEventListener('contextmenu', triggerCtx, true);
+                video.addEventListener('pointerdown', (e) => { if (e.button === 2) triggerCtx(e); }, true);
+
+                video.addEventListener('mouseenter', () => { video.muted = false; });
+                video.addEventListener('mouseleave', () => { video.muted = true; });
+
+                video.onloadedmetadata = () => {
+                    if (video.videoWidth && video.videoHeight) {
+                        node.painter_aspect = video.videoWidth / video.videoHeight;
+                        const applyResize = () => {
+                            node.onResize(node.size);
+                            node.setDirtyCanvas(true, true);
+                        };
+                        applyResize();
+                        setTimeout(applyResize, 60);
+                        setTimeout(applyResize, 250);
+                    }
+                };
+
+                widget.element.appendChild(video);
+
+                // Create custom controls overlay
+                createCustomControls(video, widget.element);
+
+                node.painter_media_element = video;
+                node.painter_media_kind = "video";
+            }
         }
     }
 });
