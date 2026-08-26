@@ -36,18 +36,6 @@ except Exception as e:
     print(f"[PainterNodes] Failed to import PainterAV2V: {e}")
 
 try:
-    from . import PainterSampler
-    _register_module(PainterSampler)
-except Exception as e:
-    print(f"[PainterNodes] Failed to import PainterSampler: {e}")
-
-try:
-    from . import PainterSequentialF2V
-    _register_module(PainterSequentialF2V)
-except Exception as e:
-    print(f"[PainterNodes] Failed to import PainterSequentialF2V: {e}")
-
-try:
     from . import PainterVideoCombine
     _register_module(PainterVideoCombine)
 except Exception as e:
@@ -156,12 +144,6 @@ except Exception as e:
     print(f"[PainterNodes] Failed to import PainterFLF2V: {e}")
 
 try:
-    from . import PainterFrameCount
-    _register_module(PainterFrameCount)
-except Exception as e:
-    print(f"[PainterNodes] Failed to import PainterFrameCount: {e}")
-
-try:
     from . import PainterHumoAI2V
     _register_module(PainterHumoAI2V)
 except Exception as e:
@@ -184,12 +166,6 @@ try:
     _register_module(PainterLongVideo)
 except Exception as e:
     print(f"[PainterNodes] Failed to import PainterLongVideo: {e}")
-
-try:
-    from . import PainterMultiF2V
-    _register_module(PainterMultiF2V)
-except Exception as e:
-    print(f"[PainterNodes] Failed to import PainterMultiF2V: {e}")
 
 try:
     from . import PainterS2Vplus
@@ -216,7 +192,6 @@ except Exception as e:
     print(f"[PainterNodes] Failed to import PainterMiniMaxRefToVideo2: {e}")
 
 
-
 try:
     from . import PainterMinimaxH3LatentUpscaler
     _register_module(PainterMinimaxH3LatentUpscaler)
@@ -233,10 +208,13 @@ try:
     from . import PainterPromptRewriter
     _register_module(PainterPromptRewriter)
 except Exception as e:
-    print(f"[PainterNodes] Failed to import PainterPromptRewriter: {e}") 
-    
+    print(f"[PainterNodes] Failed to import PainterPromptRewriter: {e}")
 
-
+try:
+    from . import PainterAudioUpload
+    _register_module(PainterAudioUpload)
+except Exception as e:
+    print(f"[PainterNodes] Failed to import PainterAudioUpload: {e}")
 
 print(f"\033[92m[PainterNodes] Loaded {len(NODE_CLASS_MAPPINGS)} nodes successfully!\033[0m")
 
