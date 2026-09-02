@@ -191,6 +191,12 @@ try:
 except Exception as e:
     print(f"[PainterNodes] Failed to import PainterMiniMaxRefToVideo2: {e}")
 
+try:
+    from . import PainterMiniMaxRefToVideo3
+    _register_module(PainterMiniMaxRefToVideo3)
+except Exception as e:
+    print(f"[PainterNodes] Failed to import PainterMiniMaxRefToVideo3: {e}")
+
 
 try:
     from . import PainterMinimaxH3LatentUpscaler
@@ -210,15 +216,22 @@ try:
 except Exception as e:
     print(f"[PainterNodes] Failed to import PainterPromptRewriter: {e}")
 
+
 try:
     from . import PainterAudioUpload
     _register_module(PainterAudioUpload)
 except Exception as e:
     print(f"[PainterNodes] Failed to import PainterAudioUpload: {e}")
 
+try:
+    from . import PainterAudioMask
+    _register_module(PainterAudioMask)
+except Exception as e:
+    print(f"[PainterNodes] Failed to import PainterAudioMask: {e}")
+
 print(f"\033[92m[PainterNodes] Loaded {len(NODE_CLASS_MAPPINGS)} nodes successfully!\033[0m")
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 WEB_DIRECTORY = "./web/js"
 
 __all__ = [
