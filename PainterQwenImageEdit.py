@@ -27,7 +27,7 @@ class PainterQwenImageEdit(io.ComfyNode):
                 io.String.Input("prompt", multiline=True),
                 io.Int.Input("batch_size", default=1, min=1, max=64),
                 io.Vae.Input("vae", optional=True),
-                io.Mask.Input("image0_mask", optional=True, tooltip="Mask applied to the first input image (image_1)"),
+                io.Mask.Input("image0_mask", optional=True, tooltip="Mask applied to the first input image (image_0)"),
                 io.Int.Input("width", default=1024, min=512, max=4096, step=8),
                 io.Int.Input("height", default=1024, min=512, max=4096, step=8),
                 io.Autogrow.Input("images", optional=True,
@@ -43,8 +43,8 @@ class PainterQwenImageEdit(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, clip, prompt, batch_size, vae=None, image1_mask=None, 
-                width=1024, height=1024, images=None) -> io.NodeOutput:
+    def execute(cls, clip, prompt, batch_size, vae=None, image0_mask=None,
+                width=1024, height=1024, images=None, **kwargs) -> io.NodeOutput:
         
         target_latent_h = height // 8
         target_latent_w = width // 8
@@ -114,8 +114,8 @@ class PainterQwenImageEdit(io.ComfyNode):
                     canvas[:, :, :resized_height_actual, :resized_width_actual] = resized_samples
                     s = canvas
                     
-                    if i == 0 and image1_mask is not None:
-                        mask = image1_mask
+                    if i == 0 and image0_mask is not None:
+                        mask = image0_mask
                         if mask.dim() == 2:
                             mask_samples = mask.unsqueeze(0).unsqueeze(0)
                         elif mask.dim() == 3:
@@ -133,8 +133,8 @@ class PainterQwenImageEdit(io.ComfyNode):
                     target_h = round(scaled_height / 8.0) * 8
                     s = comfy.utils.common_upscale(samples, target_w, target_h, "lanczos", crop)
                     
-                    if i == 0 and image1_mask is not None:
-                        mask = image1_mask
+                    if i == 0 and image0_mask is not None:
+                        mask = image0_mask
                         if mask.dim() == 2:
                             mask_samples = mask.unsqueeze(0).unsqueeze(0)
                         elif mask.dim() == 3:
