@@ -1,15 +1,23 @@
 import { app } from "../../scripts/app.js";
 /* ================================================================
-PainterMiniMaxRefToVideo3.js
-改造版：1. 参考图改为节点内部上传（不再外部连线）
-      2. 参考图上传区在提示词输入框上方
-      3. 默认3个上传框(一行)，可加行，最多9个(三行)
-      4. 每个框点击上传，右上角半透明红色X删除
-      5. 提示词仍可 @出上传的参考图
-      6. 参考音频/视频仍外部传入
-      7. 节点大小持久化修复：手动修改后刷新/重开保持
+PainterMiniMaxRefToVideo6.js  （基于 v3 的优化版）
+优化点：
+  1. 参考图上传框支持【直接拖拽图片文件】放入：
+       - 拖到某个已有图片的槽位 → 替换该槽位
+       - 拖到空槽位 / 上传区空白处 → 追加到末尾
+       - 支持一次拖入多张（自动增行，上限 3 行 × 3 = 9 张）
+  2. 去掉 width / height / length 三个输出端口（输入控件与端口保留）
+  3. 快捷标识【前台显示 = 最终输出文本】，只保留配色高亮：
+       @图片1 + 空格      → <Picture 1>
+       【台词内容】+ 空格  → <d>[Chinese] 台词内容</d>   （不自动补句号）
+       切镜2 + 空格       → [Shot 2] At 00:02.00
+     这样可以直接在节点里框选复制出可复用的完整提示词。
+  4. 新增 ⧉ 复制按钮：一键复制最终提示词到剪贴板。
+  5. 粘贴 / 回填时能识别 <Picture N>、<d>…</d>、[Shot N] At MM:SS.ff
+     以及旧格式 @图片N、【…】、切镜N，统一还原成彩色块。
 ================================================================ */
-const NODE_CLASS = "PainterMiniMaxRefToVideo3";
+const NODE_CLASS = "PainterMiniMaxRefToVideo6";
+const STYLE_ID = "mmr6-styles";
 const PROMPT_DOC_PROP = "mmr_prompt_doc";
 const WIDGET_STATE_PROP = "mmr_widget_values";
 const NODE_SIZE_PROP = "mmr_node_size";
@@ -23,7 +31,12 @@ const DEFAULT_WIDGET_VALUES = {
     ref_max_size: 1536,
 };
 const DIALOGUE_CLASS = "mmr-dialogue-block";
+const DIALOGUE_CONTENT_CLASS = "mmr-dlg-content";
+const DIALOGUE_PREFIX_CLASS = "mmr-dlg-prefix";
+const DIALOGUE_SUFFIX_CLASS = "mmr-dlg-suffix";
+const DIALOGUE_CLOSE_CLASS = "mmr-dlg-close";
 const SHOT_CHIP_CLASS = "mmr-shot-chip";
+const SHOT_LABEL_CLASS = "mmr-shot-chip-label";
 const MENTION_CHIP_CLASS = "mmr-mention-chip";
 const CHIP_SELECTOR = `.${MENTION_CHIP_CLASS}, .${SHOT_CHIP_CLASS}`;
 const CARET_SENTINEL = "\u200B";
@@ -32,6 +45,31 @@ const SHOT_TRIGGER_RE = /切镜\s*(\d+(?:\.\d+)?)$/;
 const FALLBACK_SHOT_RE = /切镜\s*(\d+(?:\.\d+)?)\s*[，,]?\s*/g;
 const BRACKET_DIALOGUE_RE = /【([^】]*)】/g;
 const MENTION_TRIGGER_RE = /@(图片|视频|音频)(\d+)$/;
+/* 把「显示成最终输出文本」的整段提示词反解析回彩色块（粘贴 / 回填用）。
+   分组顺序：
+     1 <d>…</d> 正文 | 2/3 <Picture|Video|Audio N> | 4/5/6 [Shot N] At MM:SS.ff
+     7 旧格式 切镜N   | 8 旧格式 【…】           | 9/10 旧格式 @图片N        */
+const INLINE_TOKEN_RE = new RegExp(
+    [
+        "<d>([\\s\\S]*?)<\\/d>",
+        "<(Picture|Video|Audio)\\s+(\\d+)>",
+        "\\[Shot\\s+(\\d+)\\]\\s*At\\s+(\\d{1,2}):(\\d{2}(?:\\.\\d+)?)\\s*,?",
+        "切镜\\s*(\\d+(?:\\.\\d+)?)",
+        "【([^】]*)】",
+        "@(图片|视频|音频)(\\d+)",
+    ].join("|"),
+    "gi"
+);
+const MENTION_TAG_MAP = {
+    image: "Picture",
+    video: "Video",
+    audio: "Audio",
+};
+const MENTION_TAG_TO_TYPE = {
+    picture: "image",
+    video: "video",
+    audio: "audio",
+};
 const KEYWORD_RULES = [
     {
         re: /不要背景音乐|无背景音乐|不要音乐|无音乐|无\sBGM|不要\sBGM/g,
@@ -49,15 +87,15 @@ const MENTION_TYPE_MAP = {
     "视频": "video",
     "音频": "audio",
 };
-const MENTION_TAG_MAP = {
-    image: "Picture",
-    video: "Video",
-    audio: "Audio",
-};
 const MENTION_ICON_MAP = {
     image: "🖼",
     video: "🎞️",
     audio: "🔊",
+};
+const MENTION_LABEL_MAP = {
+    image: "图片",
+    video: "视频",
+    audio: "音频",
 };
 const MENTION_MENU_CLASS = "mmr-mention-menu";
 const MENTION_MENU_ITEM_CLASS = "mmr-mention-menu-item";
@@ -134,12 +172,12 @@ function formatShotTimestamp(totalSeconds) {
     return `${mm}:${ss}`;
 }
 
+/* 台词块包裹。v6：不再自动补句号 —— 用户输入什么就输出什么 */
 function wrapDialogueTag(text) {
     const trimmed = String(text || "").trim();
     if (!trimmed) return "";
-    const withPunct = /[.?!。？!]$/.test(trimmed) ? trimmed : `${trimmed}。`;
-    if (/^\[[^\]]+\]/.test(withPunct)) return `<d>${withPunct}</d>`;
-    return `<d>[Chinese] ${withPunct}</d>`;
+    if (/^\[[^\]]+\]/.test(trimmed)) return `<d>${trimmed}</d>`;
+    return `<d>[Chinese] ${trimmed}</d>`;
 }
 
 function postProcessPromptText(text) {
@@ -318,7 +356,7 @@ async function uploadRefImageFile(file) {
 }
 
 /* ================================================================
-v3：拖拽图片到上传框（与 v6 行为一致）
+v6：拖拽图片到上传框
 ================================================================ */
 const DROP_ACTIVE_CLASS = "is-dragover";
 const IMAGE_FILE_RE = /\.(png|jpe?g|webp|bmp|gif|tiff?|avif)$/i;
@@ -366,7 +404,7 @@ async function addRefImages(node, files, startIndex = null) {
         try {
             uploaded.push(await uploadRefImageFile(file));
         } catch (err) {
-            console.error("[MMR3] 参考图上传失败:", err);
+            console.error("[MMR6] 参考图上传失败:", err);
         }
     }
     if (!uploaded.length) return false;
@@ -585,6 +623,11 @@ function createRefSlot(node, slotIndex, fileInfo) {
         slot.append(ph);
     }
 
+    // v6：支持直接把图片文件拖到该槽位（已有图则替换，空槽位则追加）
+    attachImageDropTarget(slot, (files) => {
+        addRefImages(node, files, slotIndex);
+    });
+
     slot.addEventListener("pointerdown", (e) => {
         if (e.target.closest(".mmr-ref-slot-remove")) return;
         e.preventDefault();
@@ -599,38 +642,18 @@ function createRefSlot(node, slotIndex, fileInfo) {
         const fileInput = document.createElement("input");
         fileInput.type = "file";
         fileInput.accept = "image/*";
+        fileInput.multiple = true;
         fileInput.style.display = "none";
 
         fileInput.addEventListener("change", async () => {
-            const file = fileInput.files?.[0];
-            if (!file) return;
-            try {
-                const newFileInfo = await uploadRefImageFile(file);
-                const files = getRefImageFiles(node);
-                while (files.length < slotIndex) files.push(null);
-                if (files.length <= slotIndex) {
-                    files.push(newFileInfo);
-                } else {
-                    files[slotIndex] = newFileInfo;
-                }
-                const compacted = files.filter(f => f?.filename);
-                setRefImageFiles(node, compacted);
-                renderRefUploadArea(node);
-                repairNodeLayout(node);
-            } catch (err) {
-                console.error("[MMR2] Failed to upload reference image:", err);
-            } finally {
-                fileInput.remove();
-            }
+            const picked = Array.from(fileInput.files || []);
+            fileInput.remove();
+            if (!picked.length) return;
+            await addRefImages(node, picked, slotIndex);
         });
 
         document.body.append(fileInput);
         fileInput.click();
-    });
-
-    // v3：支持直接把图片文件拖到该槽位（已有图则替换，空槽位则追加）
-    attachImageDropTarget(slot, (files) => {
-        addRefImages(node, files, slotIndex);
     });
 
     return slot;
@@ -880,18 +903,83 @@ function isDialogueBlock(node) {
     return node?.nodeType === Node.ELEMENT_NODE && node.classList?.contains(DIALOGUE_CLASS);
 }
 
+/* ---- 台词块：结构 = 不可编辑的 <d>[Chinese] + 可编辑正文 + 不可编辑 </d>
+   这样 DOM 里真实存在的就是最终输出文本，框选复制拿到的就是 <d>[Chinese] 台词</d>，
+   同时正文仍然可以直接编辑。
+   v6：不再自动补句号 —— 显示与输出都严格等于用户输入的内容。 ---- */
+function dialogueDisplayParts(rawText) {
+    const trimmed = String(rawText || "").trim();
+    const hasLangTag = trimmed ? /^\[[^\]]+\]/.test(trimmed) : false;
+    return {
+        prefix: hasLangTag ? "<d>" : "<d>[Chinese] ",
+        suffix: "</d>",
+    };
+}
+
+function dialogueContentEl(block) {
+    return block?.querySelector?.(`.${DIALOGUE_CONTENT_CLASS}`) || null;
+}
+
 function makeDialogueBlock(value = "") {
     const block = document.createElement("span");
     block.className = DIALOGUE_CLASS;
     block.spellcheck = false;
     block.dataset.dialogue = "true";
-    appendTextWithBreaks(block, value);
-    if (!String(value || "")) block.append(makeCaretSentinel());
+    // 外层不可编辑，只有正文子节点可编辑，避免光标跑到 <d> 标签外面
+    block.contentEditable = "false";
+
+    const prefix = document.createElement("span");
+    prefix.className = DIALOGUE_PREFIX_CLASS;
+    prefix.contentEditable = "false";
+
+    const content = document.createElement("span");
+    content.className = DIALOGUE_CONTENT_CLASS;
+    content.contentEditable = "true";
+    content.spellcheck = false;
+    appendTextWithBreaks(content, value);
+    if (!String(value || "")) content.append(makeCaretSentinel());
+
+    const suffix = document.createElement("span");
+    suffix.className = DIALOGUE_SUFFIX_CLASS;
+    suffix.contentEditable = "false";
+
+    const close = document.createElement("span");
+    close.className = DIALOGUE_CLOSE_CLASS;
+    close.contentEditable = "false";
+
+    block.append(prefix, content, suffix, close);
+    refreshDialogueBlockChrome(block);
     return block;
 }
 
+/* 只取可编辑正文，忽略 <d>[Chinese] / </d> 这些装饰文本 */
 function dialogueBlockText(block) {
-    return editorText(block);
+    const content = dialogueContentEl(block);
+    return editorText(content || block);
+}
+
+/* 让装饰部分与最终输出保持一致（语言标记判断；v6 不补句号） */
+function refreshDialogueBlockChrome(block) {
+    if (!block) return;
+    const content = dialogueContentEl(block);
+    if (!content) return;
+    const prefix = block.querySelector(`.${DIALOGUE_PREFIX_CLASS}`);
+    const suffix = block.querySelector(`.${DIALOGUE_SUFFIX_CLASS}`);
+    const parts = dialogueDisplayParts(editorText(content));
+    if (prefix && prefix.textContent !== parts.prefix) prefix.textContent = parts.prefix;
+    if (suffix && suffix.textContent !== parts.suffix) suffix.textContent = parts.suffix;
+}
+
+function refreshAllDialogueChrome(editor) {
+    const blocks = editor?.querySelectorAll?.(`.${DIALOGUE_CLASS}`) || [];
+    for (const block of blocks) refreshDialogueBlockChrome(block);
+}
+
+/* 把光标放到台词块正文里（空块时放到哨兵符后） */
+function setCaretAtDialogueContentEnd(block) {
+    const content = dialogueContentEl(block);
+    if (!content) return;
+    setCaretAtEndOfNode(content);
 }
 
 function dialogueBlockAtSelection(editor) {
@@ -936,7 +1024,7 @@ function insertDialogueBlockAtSelection(node, editor) {
     frag.append(before, block, after);
     range.insertNode(frag);
     editor.focus({ preventScroll: true });
-    setCaretAtEndOfNode(block);
+    setCaretAtDialogueContentEnd(block);
     return true;
 }
 
@@ -979,6 +1067,7 @@ function convertBracketsAtCaret(node, editor) {
     frag.append(before, block, after);
     range.insertNode(frag);
     setCaretAtNode(after, after.textContent.length);
+    refreshEditorDecorations(editor);
     syncPromptFromEditor(node);
     pushPromptHistory(node);
     return true;
@@ -1002,6 +1091,14 @@ function convertLooseBrackets(node, editor) {
 /* ================================================================
 切镜块
 ================================================================ */
+/* 切镜块的显示文本 = 最终输出文本：[Shot 2] At 00:02.00,
+   序号与 buildRuntimePrompt 的规则完全一致：第 k 个切镜 → [Shot k+1]。
+   末尾逗号是 h3 格式里时间戳与后续描述的固定分隔符，一并显示，
+   这样框选复制出来的文本与真正发给后端的文本逐字相同。 */
+function shotChipText(shotIndex, seconds) {
+    return `[Shot ${shotIndex}] At ${formatShotTimestamp(seconds)},`;
+}
+
 function makeShotChip(secondsValue) {
     const seconds = Number(secondsValue) || 0;
     const chip = document.createElement("span");
@@ -1009,14 +1106,11 @@ function makeShotChip(secondsValue) {
     chip.contentEditable = "false";
     chip.dataset.seconds = String(seconds);
     chip.dataset.token = `切镜${seconds}`;
-    const icon = document.createElement("span");
-    icon.className = "mmr-chip-icon";
-    icon.textContent = "✂";
     const label = document.createElement("span");
-    label.className = "mmr-shot-chip-label";
-    label.textContent = formatShotTime(seconds);
-    chip.append(icon, label);
-    chip.title = `切镜 → [Shot N] At ${formatShotTime(seconds)}`;
+    label.className = SHOT_LABEL_CLASS;
+    label.textContent = shotChipText(2, seconds);
+    chip.append(label);
+    chip.title = `切镜 ${seconds} 秒 → ${shotChipText(2, seconds)}`;
     chip.addEventListener("pointerdown", (event) => {
         event.preventDefault();
         event.stopPropagation();
@@ -1053,11 +1147,27 @@ function getShotTriggerRange(editor) {
 function validateShotChips(editor) {
     const chips = editor?.querySelectorAll?.(`.${SHOT_CHIP_CLASS}`) || [];
     let previous = -Infinity;
+    let shotIndex = 1;
     for (const chip of chips) {
+        shotIndex += 1;
         const seconds = Number(chip.dataset.seconds);
         chip.classList.toggle("is-warning", Number.isFinite(seconds) && seconds <= previous);
         if (Number.isFinite(seconds)) previous = seconds;
+        // 显示文本与最终输出保持一致（序号按出现顺序推导）
+        const text = shotChipText(shotIndex, seconds);
+        const label = chip.querySelector(`.${SHOT_LABEL_CLASS}`);
+        const target = label || chip;
+        if (target.textContent !== text) target.textContent = text;
+        chip.dataset.shotIndex = String(shotIndex);
+        chip.title = `切镜 ${seconds} 秒 → ${text}`;
     }
+}
+
+/* 输入 / 增删块后立即刷新所有块的显示（不等 200ms 节流） */
+function refreshEditorDecorations(editor) {
+    if (!editor) return;
+    validateShotChips(editor);
+    refreshAllDialogueChrome(editor);
 }
 
 /* ================================================================
@@ -1070,6 +1180,13 @@ function isMentionChip(node) {
     );
 }
 
+/* 引用块的显示文本 = 最终输出文本：<Picture 1> / <Video 1> / <Audio 1> */
+function mentionTagText(option) {
+    const prefix = MENTION_TAG_MAP[option?.type] || "Picture";
+    const ordinal = Number(option?.ordinal) || 0;
+    return `<${prefix} ${ordinal}>`;
+}
+
 function makeMentionChip(option) {
     const chip = document.createElement("span");
     chip.className = MENTION_CHIP_CLASS;
@@ -1078,27 +1195,13 @@ function makeMentionChip(option) {
     chip.dataset.label = option.label || "";
     chip.dataset.ordinal = String(option.ordinal || "");
     chip.dataset.mediaType = option.type || "image";
-    chip.title = option.tag || "";
-    const icon = document.createElement("span");
-    icon.className = "mmr-chip-icon mmr-chip-thumb";
-    const previewUrl = option.previewUrl || getMediaPreview(option.sourceNode, option.type);
-    if (previewUrl && option.type !== "audio") {
-        const img = document.createElement("img");
-        img.src = previewUrl;
-        img.alt = "";
-        img.draggable = false;
-        img.addEventListener("error", () => {
-            img.remove();
-            icon.textContent = MENTION_ICON_MAP[option.type] || "🖼";
-        });
-        icon.append(img);
-    } else {
-        icon.textContent = MENTION_ICON_MAP[option.type] || "🖼";
-    }
+    const text = mentionTagText(option);
     const label = document.createElement("span");
     label.className = "mmr-mention-chip-label";
-    label.textContent = `@${option.label || ""}`;
-    chip.append(icon, label);
+    label.textContent = text;
+    chip.append(label);
+    // 悬停提示保留原始输入形式，便于对照是第几张参考图
+    chip.title = option.label ? `${text}  ←  ${option.token || option.label}` : text;
     chip.addEventListener("pointerdown", (event) => {
         event.preventDefault();
         event.stopPropagation();
@@ -1152,6 +1255,7 @@ function convertMentionAtCaret(node, editor) {
     frag.append(before, chip, after);
     range.insertNode(frag);
     setCaretAtNode(after, after.textContent.length);
+    refreshEditorDecorations(editor);
     syncPromptFromEditor(node);
     pushPromptHistory(node);
     return true;
@@ -1373,31 +1477,81 @@ function serializeEditorDoc(editor) {
     for (const child of editor.childNodes || []) visit(child);
     return {
         version: 1,
-        text: parts.map((p) => {
-            if (p.type === "mention") return p.token;
-            if (p.type === "dialogue") return `<d>${p.text}</d>`;
-            if (p.type === "shot") return `切镜${p.seconds}`;
-            return p.text;
-        }).join(""),
+        // text 直接等于「最终发给后端的提示词」，保证前台显示 / 复制 / 输出三者一致
+        text: postProcessPromptText(partsToRuntimeText(parts)),
         parts,
     };
+}
+
+/* 把编辑器解析出的 parts 还原成最终提示词文本。
+   buildRuntimePrompt（真正发给后端）与 serializeEditorDoc（前台保存/显示）共用同一份逻辑，
+   这是「前台显示 = 实际输出」的保证。 */
+function partsToRuntimeText(parts) {
+    let shotIndex = 1;
+    const emitShot = (seconds) => {
+        shotIndex += 1;
+        return `[Shot ${shotIndex}] At ${formatShotTimestamp(seconds)},`;
+    };
+    return (Array.isArray(parts) ? parts : []).map((part) => {
+        if (part?.type === "dialogue") return wrapDialogueTag(part.text);
+        if (part?.type === "shot") return emitShot(Number(part.seconds) || 0);
+        if (part?.type === "mention") {
+            const prefix = MENTION_TAG_MAP[part.mediaType] || "Picture";
+            return `<${prefix} ${Number(part.ordinal) || 0}>`;
+        }
+        return String(part?.text || "").replace(FALLBACK_SHOT_RE, (m, s) => emitShot(Number(s)));
+    }).join("");
 }
 
 function appendDialogueBlock(container, value = "") {
     container.append(makeCaretSentinel(), makeDialogueBlock(value), makeCaretSentinel());
 }
 
-function appendPromptTextWithDialogueBlocks(container, value) {
+/* 把一段「最终提示词文本」反解析成彩色块。
+   既认新格式（<Picture 1> / <d>…</d> / [Shot 2] At 00:02.00），
+   也认旧格式（@图片1 / 【…】 / 切镜2），保证粘贴与老工作流都能还原成彩色块。 */
+function appendPromptTextWithBlocks(container, value) {
     const source = String(value || "");
-    const pattern = /<d>([\s\S]*?)<\/d>/gi;
+    const re = new RegExp(INLINE_TOKEN_RE.source, "gi");
     let cursor = 0;
     let match;
-    while ((match = pattern.exec(source))) {
+    while ((match = re.exec(source))) {
         if (match.index > cursor) {
             appendTextWithBreaks(container, source.slice(cursor, match.index));
         }
-        appendDialogueBlock(container, match[1]);
-        cursor = match.index + match[0].length;
+        const full = match[0];
+        const [, dialogue, tagName, tagOrdinal, shotNo, shotMin, shotSec,
+            legacyShot, legacyDialogue, cnType, cnOrdinal] = match;
+        if (dialogue !== undefined) {
+            appendDialogueBlock(container, dialogue);
+        } else if (tagName !== undefined) {
+            const type = MENTION_TAG_TO_TYPE[String(tagName).toLowerCase()] || "image";
+            const ordinal = parseInt(tagOrdinal, 10);
+            container.append(makeCaretSentinel(), makeMentionChip({
+                type,
+                ordinal,
+                token: `@${MENTION_LABEL_MAP[type]}${ordinal}`,
+                label: `${MENTION_LABEL_MAP[type]}${ordinal}`,
+            }), makeCaretSentinel());
+        } else if (shotNo !== undefined) {
+            const seconds = Number(shotMin) * 60 + Number(shotSec);
+            container.append(makeCaretSentinel(), makeShotChip(seconds), makeCaretSentinel());
+        } else if (legacyShot !== undefined) {
+            container.append(makeCaretSentinel(), makeShotChip(Number(legacyShot)), makeCaretSentinel());
+        } else if (legacyDialogue !== undefined) {
+            appendDialogueBlock(container, legacyDialogue);
+        } else if (cnType !== undefined) {
+            const type = MENTION_TYPE_MAP[cnType] || "image";
+            const ordinal = parseInt(cnOrdinal, 10);
+            container.append(makeCaretSentinel(), makeMentionChip({
+                type,
+                ordinal,
+                token: `@${cnType}${cnOrdinal}`,
+                label: `${cnType}${cnOrdinal}`,
+            }), makeCaretSentinel());
+        }
+        cursor = match.index + full.length;
+        if (!full.length) re.lastIndex += 1; // 防御空匹配死循环
     }
     appendTextWithBreaks(container, source.slice(cursor));
 }
@@ -1409,7 +1563,8 @@ function renderEditorFromNode(node, force = false) {
     const doc = node.properties?.[PROMPT_DOC_PROP];
     editor.textContent = "";
     if (!Array.isArray(doc?.parts)) {
-        appendPromptTextWithDialogueBlocks(editor, String(widget.value || ""));
+        appendPromptTextWithBlocks(editor, String(widget.value || ""));
+        refreshEditorDecorations(editor);
         return;
     }
     // 预先获取媒体列表（含上传参考图缩略图 URL 与外部连线源节点），
@@ -1421,14 +1576,14 @@ function renderEditorFromNode(node, force = false) {
             continue;
         }
         if (part?.type === "shot") {
-            editor.append(makeShotChip(Number(part.seconds) || 0));
+            editor.append(makeCaretSentinel(), makeShotChip(Number(part.seconds) || 0), makeCaretSentinel());
             continue;
         }
         if (part?.type === "mention") {
             const mediaType = part.mediaType || "image";
             const ordinal = Number(part.ordinal);
             const matched = media[mediaType]?.find(item => item.ordinal === ordinal);
-            editor.append(makeMentionChip({
+            editor.append(makeCaretSentinel(), makeMentionChip({
                 type: mediaType,
                 ordinal,
                 tag: part.token || "",
@@ -1436,12 +1591,12 @@ function renderEditorFromNode(node, force = false) {
                 label: part.label || "",
                 sourceNode: matched?.sourceNode,
                 previewUrl: matched?.previewUrl,
-            }));
+            }), makeCaretSentinel());
             continue;
         }
         appendTextWithBreaks(editor, part?.text || "");
     }
-    validateShotChips(editor);
+    refreshEditorDecorations(editor);
 }
 
 // 延迟刷新缩略图：刷新页面后源节点（图片序列/视频）的 imgs 是异步加载的，
@@ -1473,7 +1628,7 @@ function syncPromptFromEditor(node, markDirty = true) {
             if (widget._state) widget._state.value = doc.text;
             node.properties ||= {};
             node.properties[PROMPT_DOC_PROP] = doc;
-            validateShotChips(editor);
+            refreshEditorDecorations(editor);
             if (markDirty) {
                 node.setDirtyCanvas?.(true, false);
                 app.graph?.setDirtyCanvas?.(true, false);
@@ -1498,7 +1653,7 @@ function syncPromptFromEditorImmediate(node, markDirty = true) {
         if (widget._state) widget._state.value = doc.text;
         node.properties ||= {};
         node.properties[PROMPT_DOC_PROP] = doc;
-        validateShotChips(editor);
+        refreshEditorDecorations(editor);
         if (markDirty) {
             node.setDirtyCanvas?.(true, false);
             app.graph?.setDirtyCanvas?.(true, false);
@@ -1516,21 +1671,8 @@ function buildRuntimePrompt(node) {
     const fallback = String(promptWidget?.value || "");
     const doc = node?.properties?.[PROMPT_DOC_PROP];
     if (!Array.isArray(doc?.parts)) return postProcessPromptText(fallback);
-    let shotIndex = 1;
-    const emitShot = (seconds) => {
-        shotIndex += 1;
-        return `[Shot ${shotIndex}] At ${formatShotTimestamp(seconds)},`;
-    };
-    const pieces = doc.parts.map((part) => {
-        if (part?.type === "dialogue") return wrapDialogueTag(part.text);
-        if (part?.type === "shot") return emitShot(Number(part.seconds) || 0);
-        if (part?.type === "mention") {
-            const prefix = MENTION_TAG_MAP[part.mediaType] || "Picture";
-            return `<${prefix} ${part.ordinal}>`;
-        }
-        return String(part?.text || "").replace(FALLBACK_SHOT_RE, (m, s) => emitShot(Number(s)));
-    });
-    return postProcessPromptText(pieces.join(""));
+    // 与前台显示共用 partsToRuntimeText —— 看到什么就发什么
+    return postProcessPromptText(partsToRuntimeText(doc.parts));
 }
 
 /* ================================================================
@@ -1664,31 +1806,49 @@ function insertTextWithMentionChips(node, editor, text) {
     if (!value) return false;
     range.deleteContents();
     const fragment = document.createDocumentFragment();
-    const SPECIAL = /【[^】]*】|切镜\s*\d+(?:\.\d+)?|@(?:图片|视频|音频)\d+/g;
+    // 与 appendPromptTextWithBlocks 同一套识别规则：
+    // 新格式 <Picture 1> / <d>…</d> / [Shot 2] At 00:02.00，旧格式 @图片1 / 【…】 / 切镜2
+    const re = new RegExp(INLINE_TOKEN_RE.source, "gi");
     let lastIndex = 0;
     let match;
-    while ((match = SPECIAL.exec(value))) {
+    while ((match = re.exec(value))) {
         if (match.index > lastIndex) {
             appendPastedText(fragment, value.slice(lastIndex, match.index));
         }
-        const token = match[0];
+        const full = match[0];
+        const [, dialogue, tagName, tagOrdinal, shotNo, shotMin, shotSec,
+            legacyShot, legacyDialogue, cnType, cnOrdinal] = match;
         fragment.append(document.createTextNode(CARET_SENTINEL));
-        if (token.startsWith("【")) {
-            fragment.append(makeDialogueBlock(token.slice(1, -1)));
-        } else if (token.startsWith("@")) {
-            const m = token.match(/@(图片|视频|音频)(\d+)/);
-            if (m) {
-                const type = MENTION_TYPE_MAP[m[1]];
-                const ordinal = parseInt(m[2], 10);
-                const tag = `<${MENTION_TAG_MAP[type]} ${ordinal}>`;
-                fragment.append(makeMentionChip({ type, ordinal, tag, token, label: `${m[1]}${m[2]}` }));
-            }
-        } else {
-            const numeric = token.match(/\d+(?:\.\d+)?/);
-            fragment.append(makeShotChip(Number(numeric ? numeric[0] : 0)));
+        if (dialogue !== undefined) {
+            fragment.append(makeDialogueBlock(dialogue));
+        } else if (tagName !== undefined) {
+            const type = MENTION_TAG_TO_TYPE[String(tagName).toLowerCase()] || "image";
+            const ordinal = parseInt(tagOrdinal, 10);
+            fragment.append(makeMentionChip({
+                type,
+                ordinal,
+                token: `@${MENTION_LABEL_MAP[type]}${ordinal}`,
+                label: `${MENTION_LABEL_MAP[type]}${ordinal}`,
+            }));
+        } else if (shotNo !== undefined) {
+            fragment.append(makeShotChip(Number(shotMin) * 60 + Number(shotSec)));
+        } else if (legacyShot !== undefined) {
+            fragment.append(makeShotChip(Number(legacyShot)));
+        } else if (legacyDialogue !== undefined) {
+            fragment.append(makeDialogueBlock(legacyDialogue));
+        } else if (cnType !== undefined) {
+            const type = MENTION_TYPE_MAP[cnType] || "image";
+            const ordinal = parseInt(cnOrdinal, 10);
+            fragment.append(makeMentionChip({
+                type,
+                ordinal,
+                token: `@${cnType}${cnOrdinal}`,
+                label: `${cnType}${cnOrdinal}`,
+            }));
         }
         fragment.append(document.createTextNode(CARET_SENTINEL));
-        lastIndex = match.index + token.length;
+        lastIndex = match.index + full.length;
+        if (!full.length) re.lastIndex += 1;
     }
     if (lastIndex < value.length) {
         appendPastedText(fragment, value.slice(lastIndex));
@@ -1701,6 +1861,7 @@ function insertTextWithMentionChips(node, editor, text) {
     caret.collapse(true);
     sel.removeAllRanges();
     sel.addRange(caret);
+    refreshEditorDecorations(editor);
     return true;
 }
 
@@ -1873,6 +2034,24 @@ function showRefImageFilesWidget(widget) {
 /* ================================================================
 编辑器创建
 ================================================================ */
+/* 框选复制时剔除零宽哨兵符（光标定位用的不可见字符），
+   保证从节点里直接 Ctrl+C 拿到的就是可复用的干净提示词。 */
+function handleEditorCopy(editor, event) {
+    const sel = window.getSelection?.();
+    if (!sel || sel.isCollapsed || !sel.rangeCount) return false;
+    // 注意：整段框选时 anchorNode 就是 editor 本身，而 contains() 不含自身
+    const inEditor = (n) => n === editor || Boolean(editor.contains?.(n));
+    if (!inEditor(sel.anchorNode) && !inEditor(sel.focusNode)) return false;
+    const text = stripCaretSentinels(sel.toString());
+    try {
+        event.clipboardData?.setData("text/plain", text);
+        event.preventDefault();
+        return true;
+    } catch {
+        return false; // 无法写剪贴板时退回浏览器默认行为
+    }
+}
+
 function hideOriginalPromptWidget(widget) {
     if (!widget) return;
     if (!widget.__mmrPromptHidden) {
@@ -1929,7 +2108,7 @@ function ensurePromptEditor(node) {
     refArea.addEventListener("pointerdown", (event) => {
         event.stopPropagation();
     });
-    // v3：拖到上传区空白处 → 追加到末尾（拖到具体槽位由槽位自己处理并已阻止冒泡）
+    // v6：拖到上传区空白处 → 追加到末尾（拖到具体槽位由槽位自己处理并已阻止冒泡）
     attachImageDropTarget(refArea, (files) => {
         addRefImages(node, files, null);
     });
@@ -1979,6 +2158,8 @@ function ensurePromptEditor(node) {
     });
 
     editor.addEventListener("input", (event) => {
+        // 立即刷新切镜序号 / 台词块装饰，保证前台显示实时等于最终输出
+        refreshEditorDecorations(editor);
         syncPromptFromEditor(node);
         if (event?.isComposing || event?.inputType === "insertCompositionText" || node.__mmrPromptComposing) {
             return;
@@ -1994,6 +2175,7 @@ function ensurePromptEditor(node) {
 
     editor.addEventListener("compositionend", () => {
         node.__mmrPromptComposing = false;
+        refreshEditorDecorations(editor);
         syncPromptFromEditorImmediate(node);
         pushPromptHistory(node);
         openOrUpdateMentionMenu(node, editor);
@@ -2053,6 +2235,7 @@ function ensurePromptEditor(node) {
                 }
                 if (event.key === " ") insertPlainText(editor, " ");
                 else insertEditorLineBreak(editor);
+                refreshEditorDecorations(editor);
                 syncPromptFromEditor(node);
                 pushPromptHistory(node);
                 return;
@@ -2069,6 +2252,7 @@ function ensurePromptEditor(node) {
             event.stopPropagation();
             node.__mmrDialogueHashHandled = true;
             setTimeout(() => { node.__mmrDialogueHashHandled = false; }, 0);
+            refreshEditorDecorations(editor);
             syncPromptFromEditor(node);
             pushPromptHistory(node);
             return;
@@ -2094,10 +2278,12 @@ function ensurePromptEditor(node) {
             (backspaceDialogueBoundary(editor, node) || deleteChipNearCaret(editor, node, "backward"))
         ) {
             event.preventDefault();
+            refreshEditorDecorations(editor);
             syncPromptFromEditor(node);
             pushPromptHistory(node);
         } else if (event.key === "Delete" && deleteChipNearCaret(editor, node, "forward")) {
             event.preventDefault();
+            refreshEditorDecorations(editor);
             syncPromptFromEditor(node);
             pushPromptHistory(node);
         } else if (event.key === "Enter" && insertEditorLineBreak(editor)) {
@@ -2116,6 +2302,10 @@ function ensurePromptEditor(node) {
         syncPromptFromEditor(node);
         pushPromptHistory(node);
     });
+
+    // 框选复制时把零宽哨兵符（光标定位用的不可见字符）剔除干净，
+    // 保证从节点里直接 Ctrl+C 拿到的就是可复用的完整提示词。
+    editor.addEventListener("copy", (event) => handleEditorCopy(editor, event));
 
     editor.addEventListener("blur", () => {
         syncPromptFromEditorImmediate(node);
@@ -2168,13 +2358,27 @@ function ensurePromptEditor(node) {
         toggleOriginalView(node);
     });
 
-    optTools.append(optimizeBtn, viewBtn);
+    // v6: 一键复制最终提示词（与发给后端的文本逐字一致）
+    const copyBtn = document.createElement("button");
+    copyBtn.type = "button";
+    copyBtn.className = "mmr3-opt-btn mmr6-opt-copy";
+    copyBtn.textContent = "\u29C9";
+    copyBtn.title = "复制最终提示词（与输出完全一致）";
+    copyBtn.addEventListener("pointerdown", (e) => { e.preventDefault(); e.stopPropagation(); });
+    copyBtn.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        copyPromptFromEditor(node);
+    });
+
+    optTools.append(optimizeBtn, viewBtn, copyBtn);
     wrap.append(optTools);
 
     node.__mmrOptStatus = optStatus;
     node.__mmrOptStatusText = optStatusText;
     node.__mmrOptimizeBtn = optimizeBtn;
     node.__mmrViewBtn = viewBtn;
+    node.__mmrCopyBtn = copyBtn;
     node.__mmrViewOriginal = false;
 
     setupOptWidgetVisibility(node);
@@ -2367,6 +2571,61 @@ function setOptBusy(node, busy, text) {
     if (btn) btn.disabled = busy;
 }
 
+/* ================================================================
+v6: 复制最终提示词
+================================================================ */
+async function copyTextToClipboard(text) {
+    try {
+        if (navigator.clipboard?.writeText) {
+            await navigator.clipboard.writeText(text);
+            return true;
+        }
+    } catch { /* 非 localhost/HTTPS 时会被浏览器拒绝，走下面的降级方案 */ }
+    try {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.setAttribute("readonly", "");
+        ta.style.position = "fixed";
+        ta.style.top = "0";
+        ta.style.left = "-9999px";
+        ta.style.opacity = "0";
+        document.body.append(ta);
+        ta.select();
+        ta.setSelectionRange(0, text.length);
+        const ok = document.execCommand?.("copy");
+        ta.remove();
+        return !!ok;
+    } catch {
+        return false;
+    }
+}
+
+function flashCopyButton(node, ok) {
+    const btn = node?.__mmrCopyBtn;
+    if (!btn) return;
+    btn.textContent = ok ? "\u2713" : "\u2717";
+    btn.classList.toggle("is-ok", !!ok);
+    btn.classList.toggle("is-fail", !ok);
+    clearTimeout(node.__mmrCopyFlashTimer);
+    node.__mmrCopyFlashTimer = setTimeout(() => {
+        btn.textContent = "\u29C9";
+        btn.classList.remove("is-ok", "is-fail");
+    }, 1200);
+}
+
+async function copyPromptFromEditor(node) {
+    if (!node || node.__mmrRemoved) return;
+    if (node.__mmrEditor) syncPromptFromEditorImmediate(node, false);
+    const text = buildRuntimePrompt(node);
+    if (!text.trim()) {
+        alert("提示词为空，请先输入内容");
+        return;
+    }
+    const ok = await copyTextToClipboard(text);
+    flashCopyButton(node, ok);
+    if (!ok) alert("复制失败：浏览器拒绝了剪贴板访问，请手动在编辑器里框选复制。");
+}
+
 function getOptRefImageFiles(node) {
     const raw = node?.properties?.["mmr_ref_image_files"];
     if (typeof raw === "string") {
@@ -2408,7 +2667,7 @@ async function optimizePromptFromEditor(node) {
 
     setOptBusy(node, true, "正在优化...");
     try {
-        const resp = await fetch("/painter/optimize_prompt", {
+        const resp = await fetch("/painter/optimize_prompt6", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -2506,9 +2765,9 @@ function collectExternalMediaSummary(node) {
 样式
 ================================================================ */
 function installStyles() {
-    if (document.getElementById("mmr3-styles")) return;
+    if (document.getElementById(STYLE_ID)) return;
     const style = document.createElement("style");
-    style.id = "mmr3-styles";
+    style.id = STYLE_ID;
     style.textContent = `
 .mmr-prompt-editor-wrap {
     position: relative;
@@ -2565,7 +2824,7 @@ function installStyles() {
     vertical-align: 1px;
     border-radius: 4px;
     background: rgba(80, 200, 120, .16);
-    color: #d4f5dd;
+    color: #7fd39a;
     box-shadow: inset 0 0 0 1px rgba(80, 200, 120, .3);
     font-family: Consolas, "Courier New", monospace;
     font-size: var(--mmr-text-size);
@@ -2577,12 +2836,26 @@ function installStyles() {
     -webkit-box-decoration-break: clone;
     box-decoration-break: clone;
 }
-.mmr-dialogue-block::before {
-    content: "💬 ";
-    font-size: 0.9em;
-    opacity: 0.75;
+/* v6：去掉 💬 伪元素 —— 伪元素不参与复制，会破坏"前台显示 = 输出文本"。
+   这条同时覆盖 v3 样式表里残留的同名规则。 */
+.mmr-dialogue-block::before,
+.mmr-dialogue-block::after {
+    content: none !important;
 }
-.mmr-dialogue-block:focus {
+/* <d>[Chinese] 与 </d> 这些装饰部分用暗绿色 */
+.mmr-dlg-prefix,
+.mmr-dlg-suffix,
+.mmr-dlg-close {
+    color: #6fcf97;
+    user-select: text;
+}
+/* 可编辑的正文用亮色，一眼看出哪一段能改 */
+.mmr-dlg-content {
+    color: #eafff1;
+    caret-color: #eafff1;
+    outline: none;
+}
+.mmr-dialogue-block:focus-within {
     background: rgba(80, 200, 120, .22);
     box-shadow: inset 0 0 0 1px rgba(80, 200, 120, .42);
 }
@@ -2599,7 +2872,8 @@ function installStyles() {
     font-size: var(--mmr-text-size);
     line-height: calc(1em + 6px);
     white-space: nowrap;
-    user-select: none;
+    /* v6：改成可选中，否则框选整段提示词时 chip 文本会被跳过、复制不出来 */
+    user-select: text;
     cursor: default;
 }
 .mmr-shot-chip.is-warning {
@@ -2620,8 +2894,13 @@ function installStyles() {
     font-size: var(--mmr-text-size);
     line-height: calc(1em + 6px);
     white-space: nowrap;
-    user-select: none;
+    /* v6：改成可选中，保证整段框选复制时能拿到 <Picture 1> 这类文本 */
+    user-select: text;
     cursor: default;
+}
+.mmr-shot-chip-label,
+.mmr-mention-chip-label {
+    user-select: text;
 }
 .mmr-chip-icon {
     display: inline-block;
@@ -2751,7 +3030,7 @@ function installStyles() {
 .mmr-ref-slot.has-image:hover {
     border-color: rgba(255,255,255,0.3);
 }
-/* v3：拖拽图片悬停时的高亮 */
+/* v6：拖拽图片悬停时的高亮 */
 .mmr-ref-upload-area.is-dragover {
     background: rgba(90, 169, 240, 0.12);
     box-shadow: inset 0 0 0 1px rgba(90, 169, 240, 0.45);
@@ -2913,6 +3192,17 @@ function installStyles() {
     border-color: rgba(90, 169, 240, 0.55);
     background: rgba(90, 169, 240, 0.12);
 }
+/* v6：复制按钮 */
+.mmr6-opt-copy.is-ok {
+    color: #8ee6a6;
+    border-color: rgba(80, 200, 120, 0.6);
+    background: rgba(80, 200, 120, 0.12);
+}
+.mmr6-opt-copy.is-fail {
+    color: #ffb4a8;
+    border-color: rgba(255, 110, 110, 0.6);
+    background: rgba(255, 110, 110, 0.12);
+}
 `;
     document.head.append(style);
 }
@@ -3045,6 +3335,11 @@ function installNode(nodeType, nodeData) {
             clearTimeout(syncThrottleMap.get(this));
             syncThrottleMap.delete(this);
         }
+        if (this.__mmrCopyFlashTimer) {
+            clearTimeout(this.__mmrCopyFlashTimer);
+            this.__mmrCopyFlashTimer = null;
+        }
+        this.__mmrCopyBtn = null;
 
         this.__mmrEditorWrap?.remove?.();
         this.__mmrEditor = null;
@@ -3122,7 +3417,7 @@ function installNode(nodeType, nodeData) {
 扩展注册
 ================================================================ */
 app.registerExtension({
-    name: "PainterMiniMaxRefToVideo3",
+    name: "PainterMiniMaxRefToVideo6",
     setup() {
         if (installed) return;
         installed = true;

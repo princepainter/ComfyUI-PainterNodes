@@ -111,12 +111,19 @@ class PainterVideoCombine:
             args += ["-vf", "split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"]
 
         if audio_temp_path:
+            # 音轨必须"不短于"画面，否则下面的 -shortest 会把最后一帧画面切掉。
+            # video_duration = n / frame_rate 只保留 3 位小数，除不尽时会被截短
+            # （例：17 帧 / 24fps = 0.70833 -> atrim 到 0.708），-shortest 就在
+            # 0.708s 收尾，最后一帧被丢。多垫一帧再交给 -shortest 裁，画面一帧
+            # 不少，音轨长度仍然等于画面长度。
+            eps = 1.0 / float(frame_rate)
+            safe_duration = video_duration + eps
             if audio_duration < video_duration:
-                pad_duration = video_duration - audio_duration
-                if pad_duration > 0.01:
-                    args += ["-af", f"apad=pad_dur={pad_duration:.3f}"]
-            elif audio_duration > video_duration:
-                args += ["-af", f"atrim=duration={video_duration:.3f}"]
+                pad_duration = video_duration - audio_duration + eps
+                args += ["-af", f"apad=pad_dur={pad_duration:.6f},"
+                                f"atrim=duration={safe_duration:.6f}"]
+            else:
+                args += ["-af", f"atrim=duration={safe_duration:.6f}"]
 
             args += ["-shortest"]
 

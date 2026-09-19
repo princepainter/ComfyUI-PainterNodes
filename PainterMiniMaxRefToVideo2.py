@@ -243,24 +243,18 @@ class PainterMiniMaxRefToVideo2(io.ComfyNode):
         ref_blocks = []
 
         # --- Load internally uploaded reference images ---
-        print(f"[MMR2] execute received ref_image_files = {ref_image_files!r}")
-        print(f"[MMR2] execute prompt = {prompt!r}")
         try:
             files_list = json.loads(ref_image_files) if isinstance(ref_image_files, str) else ref_image_files
         except (json.JSONDecodeError, TypeError):
             files_list = []
 
-        print(f"[MMR2] parsed files_list = {files_list!r}")
         if isinstance(files_list, list):
             for file_info in files_list:
                 if not file_info:
                     continue
                 img = _load_uploaded_ref_image(file_info)
                 if img is None:
-                    print(f"[MMR2] WARNING: failed to load image: {file_info!r}")
                     continue
-
-                print(f"[MMR2] loaded image shape={img.shape} from {file_info!r}")
                 h, w = img.shape[1], img.shape[2]
                 scale = min(1.0, ref_max_size / max(w, h))
 
@@ -372,7 +366,6 @@ class PainterMiniMaxRefToVideo2(io.ComfyNode):
                 }
             )
 
-        print(f"[MMR2] ref_items count={len(ref_items)}, ref_blocks count={len(ref_blocks)}")
         tokens = clip.tokenize(prompt, minimax_ref_items=ref_items)
         cond = clip.encode_from_tokens_scheduled(tokens)
 

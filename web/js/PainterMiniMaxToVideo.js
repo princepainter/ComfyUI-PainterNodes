@@ -1,6 +1,6 @@
 import { app } from "../../scripts/app.js";
 /* ================================================================
-PainterMiniMaxRefToVideo3.js
+PainterMiniMaxToVideo.js
 改造版：1. 参考图改为节点内部上传（不再外部连线）
       2. 参考图上传区在提示词输入框上方
       3. 默认3个上传框(一行)，可加行，最多9个(三行)
@@ -9,7 +9,7 @@ PainterMiniMaxRefToVideo3.js
       6. 参考音频/视频仍外部传入
       7. 节点大小持久化修复：手动修改后刷新/重开保持
 ================================================================ */
-const NODE_CLASS = "PainterMiniMaxRefToVideo3";
+const NODE_CLASS = "PainterMiniMaxToVideo";
 const PROMPT_DOC_PROP = "mmr_prompt_doc";
 const WIDGET_STATE_PROP = "mmr_widget_values";
 const NODE_SIZE_PROP = "mmr_node_size";
@@ -224,47 +224,6 @@ function getRefImageFiles(node) {
     }
 }
 
-/* 通知 ComfyUI「这个节点有改动」，让 workflow 的持久化快照更新。
-
-   ComfyUI 1.x 的「变更 → 持久化」链路是：
-       ChangeTracker.checkState()          ← 唯一的变更检测入口
-         → 比对 activeState，发现差异
-           → updateModified() → dispatch 'graphChanged' 事件
-               → useWorkflowPersistence  写 Draft 快照（刷新恢复的数据源）
-               → useWorkflowAutoSave     写服务端 workflow 文件
-
-   而 ChangeTracker 只在官方时机调 checkState()：keydown / keyup / mouseup /
-   画布内点击 / 右键菜单关闭 等。事件顺序是 mouseup → click，我们的删除按钮
-   逻辑跑在 click 里，所以官方那次检查永远早一步、看不到这次改动。
-
-   注意 app.graph.change() 是无效的：新版 ComfyUI 里 graph.onChange 为
-   undefined，graph.change() 不会派发任何东西，也就不会触发持久化。
-   这正是「删掉参考图后刷新又复活」的根因 —— 上传后通常还会接着打字，
-   打字触发的 keydown 顺带把状态存了，所以上传反而看起来是正常的。
-
-   凡是改动持久化数据的地方都要调一次。 */
-function notifyGraphChanged(node) {
-    // 1) 首选：直接走官方变更检测入口
-    try {
-        const tracker = app?.extensionManager?.workflow?.activeWorkflow?.changeTracker;
-        if (typeof tracker?.checkState === "function") {
-            tracker.checkState();
-            return;
-        }
-    } catch { /* ignore */ }
-
-    // 2) 兜底：ChangeTracker.init() 把 checkState 挂在 window 的 mouseup 上，
-    //    派发一个等价事件即可走到同一条链路（不依赖内部对象结构）
-    try {
-        window.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
-    } catch { /* ignore */ }
-
-    // 3) 老版 ComfyUI 兼容
-    try {
-        (node?.graph || app?.graph)?.change?.();
-    } catch { /* ignore */ }
-}
-
 function setRefImageFiles(node, files) {
     node.properties ||= {};
     const compacted = files.filter(f => f?.filename);
@@ -277,7 +236,6 @@ function setRefImageFiles(node, files) {
         widget.value = jsonStr;
         if (widget._state) widget._state.value = jsonStr;
     }
-    notifyGraphChanged(node);
 }
 
 function getRefRows(node) {
@@ -288,7 +246,6 @@ function getRefRows(node) {
 function setRefRows(node, rows) {
     node.properties ||= {};
     node.properties[REF_ROWS_PROP] = Math.min(MAX_REF_ROWS, Math.max(1, rows));
-    notifyGraphChanged(node);
 }
 
 function getRefImagePreviewUrl(fileInfo) {
@@ -315,154 +272,6 @@ async function uploadRefImageFile(file) {
         subfolder: data.subfolder || "",
         type: data.type || "input",
     };
-}
-
-/* ================================================================
-v3：拖拽图片到上传框（与 v6 行为一致）
-================================================================ */
-const DROP_ACTIVE_CLASS = "is-dragover";
-const IMAGE_FILE_RE = /\.(png|jpe?g|webp|bmp|gif|tiff?|avif)$/i;
-
-function isImageFile(file) {
-    if (!file) return false;
-    if (file.type?.startsWith("image/")) return true;
-    return IMAGE_FILE_RE.test(String(file.name || ""));
-}
-
-/* dragover 阶段只有 types 可用，用它判断是不是"拖进来了文件" */
-function hasFilePayload(dataTransfer) {
-    const types = dataTransfer?.types;
-    if (!types) return false;
-    try {
-        return Array.from(types).includes("Files");
-    } catch {
-        return false;
-    }
-}
-
-function imageFilesFromDataTransfer(dataTransfer) {
-    if (!dataTransfer) return [];
-    const out = [];
-    const list = dataTransfer.files;
-    if (list && list.length) {
-        for (const f of list) if (isImageFile(f)) out.push(f);
-    }
-    if (!out.length && dataTransfer.items?.length) {
-        for (const item of dataTransfer.items) {
-            if (item?.kind !== "file") continue;
-            const f = item.getAsFile?.();
-            if (isImageFile(f)) out.push(f);
-        }
-    }
-    return out;
-}
-
-/* 把拖入/选中的图片写入参考图列表：
-   startIndex 有值时从该槽位开始替换（多张则依次顺延），否则追加到末尾。 */
-async function addRefImages(node, files, startIndex = null) {
-    if (!node || !files?.length) return false;
-    const uploaded = [];
-    for (const file of files) {
-        try {
-            uploaded.push(await uploadRefImageFile(file));
-        } catch (err) {
-            console.error("[MMR3] 参考图上传失败:", err);
-        }
-    }
-    if (!uploaded.length) return false;
-
-    const list = getRefImageFiles(node).filter((f) => f?.filename);
-    if (startIndex != null && startIndex >= 0 && startIndex < list.length) {
-        list.splice(startIndex, 1, ...uploaded);
-    } else {
-        list.push(...uploaded);
-    }
-
-    if (list.length > MAX_REF_SLOTS) {
-        list.length = MAX_REF_SLOTS;
-        alert(`参考图最多 ${MAX_REF_SLOTS} 张（${MAX_REF_ROWS} 行 × ${SLOTS_PER_ROW} 列），多出的图片已忽略。`);
-    }
-
-    const neededRows = Math.min(MAX_REF_ROWS, Math.max(1, Math.ceil(list.length / SLOTS_PER_ROW)));
-    if (neededRows > getRefRows(node)) setRefRows(node, neededRows);
-
-    setRefImageFiles(node, list);
-    renderRefUploadArea(node);
-    repairNodeLayout(node);
-    return true;
-}
-
-/* 给一个元素挂上"接收图片文件"的拖放行为 */
-const DROP_HIGHLIGHT_SELECTOR =
-    `.mmr-ref-slot.${DROP_ACTIVE_CLASS}, .mmr-ref-upload-area.${DROP_ACTIVE_CLASS}`;
-
-/* 清掉所有拖拽高亮。
-   坑：drop 事件会被更内层的元素 stopPropagation，外层就收不到，
-   高亮（淡蓝框）会一直留着直到刷新。所以统一在这里兜底清理。 */
-function clearDropHighlights() {
-    document.querySelectorAll?.(DROP_HIGHLIGHT_SELECTOR)?.forEach((el) => {
-        el.classList.remove(DROP_ACTIVE_CLASS);
-    });
-}
-
-/* 同一时刻只高亮一个投放目标，否则槽位和上传区会同时亮起 */
-function highlightDropTarget(el) {
-    document.querySelectorAll?.(DROP_HIGHLIGHT_SELECTOR)?.forEach((other) => {
-        if (other !== el) other.classList.remove(DROP_ACTIVE_CLASS);
-    });
-    el.classList.add(DROP_ACTIVE_CLASS);
-}
-
-let dropCleanupInstalled = false;
-function installGlobalDropCleanup() {
-    if (dropCleanupInstalled) return;
-    dropCleanupInstalled = true;
-    const clear = () => clearDropHighlights();
-    // 捕获阶段执行，早于元素自身的 drop 处理器 —— 清高亮不影响后续的文件处理
-    window.addEventListener("drop", clear, true);
-    window.addEventListener("dragend", clear, true);
-    // 拖出窗口 / 按 Esc 取消拖拽时，dragleave 的 relatedTarget 为 null
-    document.addEventListener("dragleave", (event) => {
-        if (event.relatedTarget) return;
-        clear();
-    }, true);
-}
-
-function attachImageDropTarget(el, onFiles) {
-    if (!el || el.__mmrDropBound) return;
-    el.__mmrDropBound = true;
-
-    el.addEventListener("dragover", (event) => {
-        if (!hasFilePayload(event.dataTransfer)) return;
-        event.preventDefault();
-        event.stopPropagation();
-        try { event.dataTransfer.dropEffect = "copy"; } catch { /* ignore */ }
-        highlightDropTarget(el);
-    });
-
-    el.addEventListener("dragenter", (event) => {
-        if (!hasFilePayload(event.dataTransfer)) return;
-        event.preventDefault();
-        event.stopPropagation();
-        highlightDropTarget(el);
-    });
-
-    el.addEventListener("dragleave", (event) => {
-        event.stopPropagation();
-        // 在子元素之间移动时也会触发 dragleave，靠 relatedTarget 过滤掉
-        if (event.relatedTarget && el.contains(event.relatedTarget)) return;
-        el.classList.remove(DROP_ACTIVE_CLASS);
-    });
-
-    el.addEventListener("drop", (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        event.stopImmediatePropagation?.();
-        clearDropHighlights();
-        const files = imageFilesFromDataTransfer(event.dataTransfer);
-        if (!files.length) return;
-        onFiles(files);
-    });
 }
 
 function renderRefUploadArea(node) {
@@ -628,11 +437,6 @@ function createRefSlot(node, slotIndex, fileInfo) {
         fileInput.click();
     });
 
-    // v3：支持直接把图片文件拖到该槽位（已有图则替换，空槽位则追加）
-    attachImageDropTarget(slot, (files) => {
-        addRefImages(node, files, slotIndex);
-    });
-
     return slot;
 }
 
@@ -720,19 +524,8 @@ function applyNodeSizeNow(node, size) {
     if (!node || !Array.isArray(size) && size?.length == null) return;
     node.__mmrRestoringSize = true;
     try {
-        const targetW = Math.max(220, Math.min(4000, Math.round(Number(size?.[0]) || DEFAULT_NODE_SIZE[0])));
-        let targetH = Math.max(120, Math.min(4000, Math.round(Number(size?.[1]) || DEFAULT_NODE_SIZE[1])));
-        // 若 savedSize 不够 fit 当前 widgets（含 DOM widget 高度），
-        // 自动扩大到 computeSize()，避免 mmr_prompt_editor 等 DOM widget
-        // 被节点 size 截断而视觉上"被盖住"。不缩小——保留用户的紧凑选择。
-        try {
-            const computed = node.computeSize?.(targetW);
-            if (Array.isArray(computed) && computed[1] > targetH + 4) {
-                targetH = Math.min(4000, Math.round(computed[1]));
-            }
-        } catch (_) {}
-        node.setSize?.([targetW, targetH]);
-        writeNodeSize(node, [targetW, targetH]);
+        node.setSize?.(size);
+        writeNodeSize(node, size);
         node._widgetSlotsDirty = true;
         node.setDirtyCanvas?.(true, true);
     } finally {
@@ -1929,10 +1722,6 @@ function ensurePromptEditor(node) {
     refArea.addEventListener("pointerdown", (event) => {
         event.stopPropagation();
     });
-    // v3：拖到上传区空白处 → 追加到末尾（拖到具体槽位由槽位自己处理并已阻止冒泡）
-    attachImageDropTarget(refArea, (files) => {
-        addRefImages(node, files, null);
-    });
     wrap.append(refArea);
 
     // --- 提示词编辑器 ---
@@ -2129,56 +1918,6 @@ function ensurePromptEditor(node) {
     });
 
     wrap.append(editor);
-
-    // ============ v3: prompt optimizer toolbar ( ✦ optimize, </> view original ) ============
-    const optStatus = document.createElement("div");
-    optStatus.className = "mmr3-opt-status";
-    optStatus.style.display = "none";
-    const optStatusSpinner = document.createElement("span");
-    optStatusSpinner.className = "mmr3-opt-status-spinner";
-    const optStatusText = document.createElement("span");
-    optStatusText.className = "mmr3-opt-status-text";
-    optStatus.append(optStatusSpinner, optStatusText);
-    wrap.append(optStatus);
-
-    const optTools = document.createElement("div");
-    optTools.className = "mmr3-opt-tools";
-
-    const optimizeBtn = document.createElement("button");
-    optimizeBtn.type = "button";
-    optimizeBtn.className = "mmr3-opt-btn mmr3-opt-optimize";
-    optimizeBtn.textContent = "\u2726";
-    optimizeBtn.title = "\u63d0\u793a\u8bcd\u4f18\u5316\uff08\u8c03\u7528\u672c\u5730 Ollama\uff09";
-    optimizeBtn.addEventListener("pointerdown", (e) => { e.preventDefault(); e.stopPropagation(); });
-    optimizeBtn.addEventListener("click", (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        optimizePromptFromEditor(node);
-    });
-
-    const viewBtn = document.createElement("button");
-    viewBtn.type = "button";
-    viewBtn.className = "mmr3-opt-btn mmr3-opt-view";
-    viewBtn.innerHTML = "\u25A3";
-    viewBtn.title = "\u663e\u793a\u539f\u59cb\u63d0\u793a\u8bcd";
-    viewBtn.addEventListener("pointerdown", (e) => { e.preventDefault(); e.stopPropagation(); });
-    viewBtn.addEventListener("click", (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        toggleOriginalView(node);
-    });
-
-    optTools.append(optimizeBtn, viewBtn);
-    wrap.append(optTools);
-
-    node.__mmrOptStatus = optStatus;
-    node.__mmrOptStatusText = optStatusText;
-    node.__mmrOptimizeBtn = optimizeBtn;
-    node.__mmrViewBtn = viewBtn;
-    node.__mmrViewOriginal = false;
-
-    setupOptWidgetVisibility(node);
-
     node.__mmrEditor = editor;
     node.__mmrEditorWrap = wrap;
 
@@ -2284,231 +2023,12 @@ function patchGraphToPrompt() {
 }
 
 /* ================================================================
-v3: 提示词优化（Ollama HTTP）+ 显示原始提示词
-================================================================ */
-const OPT_WIDGET_NAMES = ["opt_model", "opt_api_url", "opt_max_length", "opt_template"];
-
-function setupOptWidgetVisibility(node) {
-    const sw = getWidget(node, "enable_prompt_optimize");
-    const enabled = !!(sw && sw.value);
-    // 开关语义：只控制「是否显示提示词优化选项」。
-    // ✦ 优化按钮与 </> 按钮始终可用，不依赖此开关。
-    if (sw) {
-        sw.label = "显示提示词优化选项";
-        const tip =
-            "开启：显示下方优化选项（模型 / 接口 / 最大长度 / 模板）。\n" +
-            "关闭：隐藏下方选项保持节点简洁。\n" +
-            "提示词优化始终可用——直接点击提示词编辑器右下角的 ✦ 按钮即可，无需先打开本开关。";
-        if (sw.options) sw.options.tooltip = tip;
-    }
-    // 用三件套彻底隐藏 widget（与 hideRefImageFilesWidget / hideOriginalPromptWidget 一致）：
-    //   1) w.hidden = true
-    //   2) options.hidden = true  (LiteGraph 部分渲染路径读 options.hidden)
-    //   3) w.computeSize = () => [0, -4]  (强制高度为 0，否则布局仍占位)
-    node.__mmrOptOrigState ||= {};
-    const origState = node.__mmrOptOrigState;
-    for (const name of OPT_WIDGET_NAMES) {
-        const w = getWidget(node, name);
-        if (!w) continue;
-        // 首次记录原始状态（用于恢复显示）
-        if (!(name in origState)) {
-            origState[name] = {
-                hidden: !!w.hidden,
-                computeSize: w.computeSize,
-            };
-        }
-        if (!enabled) {
-            w.hidden = true;
-            setWidgetOption(w, "hidden", true);
-            setWidgetOption(w, "canvasOnly", true);
-            w.computeSize = () => [0, -4];
-        } else {
-            const o = origState[name] || { hidden: false, computeSize: null };
-            w.hidden = !!o.hidden;
-            setWidgetOption(w, "hidden", !!o.hidden);
-            setWidgetOption(w, "canvasOnly", false);
-            if (o.computeSize) {
-                w.computeSize = o.computeSize;
-            } else {
-                delete w.computeSize;
-            }
-        }
-    }
-    if (sw && !sw.__mmrV3CallbackInstalled) {
-        sw.__mmrV3CallbackInstalled = true;
-        const orig = sw.callback;
-        sw.callback = function () {
-            const r = orig ? orig.apply(this, arguments) : undefined;
-            setupOptWidgetVisibility(node);
-            try {
-                app.graph?.setDirtyCanvas?.(true, true);
-                node.computeSize?.();
-            } catch (_) {}
-            return r;
-        };
-    }
-    // ✦ / ▣ 按钮始终可用，不再受开关影响
-    if (node.__mmrOptimizeBtn) {
-        node.__mmrOptimizeBtn.disabled = false;
-        node.__mmrOptimizeBtn.title = "提示词优化（调用本地 Ollama）";
-    }
-    if (node.__mmrViewBtn) {
-        node.__mmrViewBtn.disabled = false;
-    }
-}
-
-function setOptBusy(node, busy, text) {
-    const status = node.__mmrOptStatus;
-    const textEl = node.__mmrOptStatusText;
-    const btn = node.__mmrOptimizeBtn;
-    if (!status || !textEl) return;
-    status.style.display = busy ? "flex" : "none";
-    textEl.textContent = text || "";
-    if (btn) btn.disabled = busy;
-}
-
-function getOptRefImageFiles(node) {
-    const raw = node?.properties?.["mmr_ref_image_files"];
-    if (typeof raw === "string") {
-        try { return JSON.parse(raw); } catch (_) { return []; }
-    }
-    if (Array.isArray(raw)) return raw;
-    return [];
-}
-
-async function optimizePromptFromEditor(node) {
-    if (!node || node.__mmrRemoved) return;
-    if (node.__mmrOptimizing) return;
-    node.__mmrOptimizing = true;
-    const promptWidget = getWidget(node, "prompt");
-    if (!promptWidget) {
-        node.__mmrOptimizing = false;
-        return;
-    }
-
-    syncPromptFromEditorImmediate(node, false);
-    const currentPrompt = String(promptWidget.value || "").trim();
-    if (!currentPrompt) {
-        alert("提示词为空，请先输入内容");
-        node.__mmrOptimizing = false;
-        return;
-    }
-
-    // "原始"语义：本次（=上一次）优化前用户手写的内容。
-    // 每次优化都覆盖保存，所以用户连续生不同视频时，</> 始终显示"上一次优化前的最新手写"。
-    node.properties ||= {};
-    node.properties["mmr3_original_prompt"] = currentPrompt;
-
-    const api_url = String(getWidget(node, "opt_api_url")?.value || "http://127.0.0.1:11434").trim();
-    const model = String(getWidget(node, "opt_model")?.value || "qwen3.8-27b:latest").trim();
-    const max_length = parseInt(getWidget(node, "opt_max_length")?.value || "1024", 10) || 1024;
-    const template = String(getWidget(node, "opt_template")?.value || "").trim();
-    const images = getOptRefImageFiles(node).filter(f => f && f.filename);
-    const external_summary = collectExternalMediaSummary(node);
-
-    setOptBusy(node, true, "正在优化...");
-    try {
-        const resp = await fetch("/painter/optimize_prompt", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                prompt: currentPrompt,
-                images,
-                model,
-                api_url,
-                max_length,
-                template,
-                external_media_summary: external_summary,
-            }),
-        });
-        const data = await resp.json().catch(() => ({}));
-        if (!resp.ok || !data || data.ok !== true) {
-            throw new Error((data && data.error) || `HTTP ${resp.status}`);
-        }
-        const optimized = String(data.prompt || "").trim();
-        if (!optimized) throw new Error("返回内容为空");
-
-        promptWidget.value = optimized;
-        if (promptWidget._state) promptWidget._state.value = optimized;
-        // mmr3_original_prompt 不再覆盖（已在入口处保存了"本次优化前的文本"）
-        if (Array.isArray(node.properties?.["mmr_prompt_doc"]?.parts)) {
-            delete node.properties["mmr_prompt_doc"];
-        }
-        node.__mmrViewOriginal = false;
-        if (node.__mmrViewBtn) node.__mmrViewBtn.classList.remove("is-active");
-        renderEditorFromNode(node, true);
-        setOptBusy(node, false, "优化完成");
-        setTimeout(() => setOptBusy(node, false, ""), 1500);
-    } catch (exc) {
-        setOptBusy(node, false, "");
-        const msg = (exc && exc.message) || String(exc);
-        alert("提示词优化失败：" + msg);
-    } finally {
-        node.__mmrOptimizing = false;
-    }
-}
-
-function toggleOriginalView(node) {
-    const promptWidget = getWidget(node, "prompt");
-    if (!promptWidget) return;
-    node.properties ||= {};
-    const original = node.properties["mmr3_original_prompt"];
-    if (original === undefined || original === null) {
-        alert("尚未进行过优化，无原始提示词可切换");
-        return;
-    }
-    const showing = !!node.__mmrViewOriginal;
-    if (!showing) {
-        // 进入「显示原始」：先存一份当前 widget 文本（最新优化结果）以便恢复
-        syncPromptFromEditorImmediate(node, false);
-        node.properties["mmr3_view_backup"] = String(promptWidget.value || "");
-        promptWidget.value = String(original);
-        node.__mmrViewOriginal = true;
-        node.__mmrViewBtn?.classList.add("is-active");
-    } else {
-        const backup = node.properties["mmr3_view_backup"];
-        promptWidget.value = String(backup !== undefined ? backup : original);
-        node.__mmrViewOriginal = false;
-        node.__mmrViewBtn?.classList.remove("is-active");
-    }
-    if (promptWidget._state) promptWidget._state.value = promptWidget.value;
-    if (Array.isArray(node.properties?.["mmr_prompt_doc"]?.parts)) {
-        delete node.properties["mmr_prompt_doc"];
-    }
-    renderEditorFromNode(node, true);
-}
-
-function collectExternalMediaSummary(node) {
-    if (!node || !Array.isArray(node.inputs)) return "";
-    const lines = [];
-    for (const inp of node.inputs) {
-        if (!inp || inp.link == null) continue;
-        const name = String(inp.name || "");
-        const type = inp.type;
-        const srcNode = app.graph?.getNodeById?.(inp.link.origin_id);
-        const srcTitle = (srcNode && (srcNode.type || srcNode.title)) || "external node";
-        if (name.startsWith("ref_video_") && type === "IMAGE") {
-            const idx = name.replace(/^ref_video_/, "");
-            lines.push(`外部参考视频 #${idx}（来源：${srcTitle}）`);
-        } else if (name.startsWith("ref_video_audio_") && type === "AUDIO") {
-            const idx = name.replace(/^ref_video_audio_/, "");
-            lines.push(`外部视频音轨 #${idx}（来源：${srcTitle}）`);
-        } else if (name.startsWith("ref_audio_") && type === "AUDIO") {
-            const idx = name.replace(/^ref_audio_/, "");
-            lines.push(`外部参考音频 #${idx}（来源：${srcTitle}）`);
-        }
-    }
-    if (!lines.length) return "";
-    return "外部已连线参考媒体（这些媒体本身未发送给 qwen，但请在重写时考虑它们的内容）：\n" + lines.join("\n");
-}
-
-/* ================================================================
 样式
 ================================================================ */
 function installStyles() {
-    if (document.getElementById("mmr3-styles")) return;
+    if (document.getElementById("mmr2-styles")) return;
     const style = document.createElement("style");
-    style.id = "mmr3-styles";
+    style.id = "mmr2-styles";
     style.textContent = `
 .mmr-prompt-editor-wrap {
     position: relative;
@@ -2751,17 +2271,6 @@ function installStyles() {
 .mmr-ref-slot.has-image:hover {
     border-color: rgba(255,255,255,0.3);
 }
-/* v3：拖拽图片悬停时的高亮 */
-.mmr-ref-upload-area.is-dragover {
-    background: rgba(90, 169, 240, 0.12);
-    box-shadow: inset 0 0 0 1px rgba(90, 169, 240, 0.45);
-}
-.mmr-ref-slot.is-dragover {
-    border-style: solid;
-    border-color: #6cb6ff;
-    background: rgba(90, 169, 240, 0.22);
-    box-shadow: 0 0 0 2px rgba(90, 169, 240, 0.25);
-}
 .mmr-ref-slot img {
     width: 100%;
     height: 100%;
@@ -2844,75 +2353,6 @@ function installStyles() {
     opacity: 0.25;
     cursor: not-allowed;
 }
-.mmr3-opt-status {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 6px 10px;
-    margin-top: 6px;
-    background: rgba(255, 178, 102, 0.12);
-    border: 1px solid rgba(255, 178, 102, 0.35);
-    border-radius: 6px;
-    font-size: 12px;
-    color: #ffd9a8;
-    font-family: Consolas, "Courier New", monospace;
-}
-.mmr3-opt-status-spinner {
-    width: 12px;
-    height: 12px;
-    border: 2px solid rgba(255, 178, 102, 0.35);
-    border-top-color: #ffd9a8;
-    border-radius: 50%;
-    animation: mmr3-opt-spin 0.8s linear infinite;
-    flex: 0 0 12px;
-}
-.mmr3-opt-status-text {
-    flex: 1;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
-@keyframes mmr3-opt-spin {
-    to { transform: rotate(360deg); }
-}
-.mmr3-opt-tools {
-    display: flex;
-    justify-content: flex-end;
-    gap: 6px;
-    padding-top: 4px;
-}
-.mmr3-opt-btn {
-    padding: 2px 10px;
-    border: 1px solid rgba(255,255,255,0.15);
-    border-radius: 4px;
-    background: transparent;
-    color: rgba(255,255,255,0.55);
-    cursor: pointer;
-    font-size: 13px;
-    font-family: Consolas, "Courier New", monospace;
-    transition: all 0.15s;
-    min-width: 28px;
-}
-.mmr3-opt-btn:hover:not(:disabled) {
-    border-color: rgba(255,255,255,0.4);
-    color: rgba(255,255,255,0.85);
-    background: rgba(255,255,255,0.05);
-}
-.mmr3-opt-btn:disabled {
-    opacity: 0.3;
-    cursor: not-allowed;
-}
-.mmr3-opt-optimize.is-busy {
-    color: #ffd9a8;
-    border-color: rgba(255, 178, 102, 0.5);
-    background: rgba(255, 178, 102, 0.08);
-}
-.mmr3-opt-view.is-active {
-    color: #9ccaff;
-    border-color: rgba(90, 169, 240, 0.55);
-    background: rgba(90, 169, 240, 0.12);
-}
 `;
     document.head.append(style);
 }
@@ -2986,11 +2426,6 @@ function installNode(nodeType, nodeData) {
         ensurePromptEditor(this);
         hideRefImageFilesWidget(this);
         restoreWidgetState(this, incomingState);
-        // ensurePromptEditor 在 __mmrEditor 已存在时会早返回，
-        // 这里显式跑一次 setupOptWidgetVisibility，确保开关状态恢复后
-        // opt_* 控件的显隐能跟随 sw.value（onNodeCreated 时默认 true，
-        // 若工作流存的是 false，opt_* 必须立刻隐藏）。
-        setupOptWidgetVisibility(this);
         renderEditorFromNode(this);
         renderRefUploadArea(this);
         resetPromptHistory(this);
@@ -3122,13 +2557,12 @@ function installNode(nodeType, nodeData) {
 扩展注册
 ================================================================ */
 app.registerExtension({
-    name: "PainterMiniMaxRefToVideo3",
+    name: "PainterMiniMaxToVideo",
     setup() {
         if (installed) return;
         installed = true;
         patchGraphToPrompt();
         installStyles();
-        installGlobalDropCleanup();
 
         document.addEventListener("pointerdown", (event) => {
             if (!activeMentionMenu) return;

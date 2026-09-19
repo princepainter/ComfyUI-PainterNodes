@@ -1,48 +1,152 @@
-from typing import Any as any_type
-from comfy import model_management
+"""PainterVRAM - tune ComfyUI's extra VRAM reservation at runtime.
+
+Two modes:
+  manual - reserve exactly the given GB value.
+  auto   - measure what the GPU is currently using and reserve that plus the
+           given GB on top, so ComfyUI stops trying to occupy the whole card.
+
+Auto mode needs a way to read GPU memory. NVML (pynvml) is preferred, with a
+torch fallback so the node still works on machines where NVML is unavailable.
+
+Measurement has to happen *after* the optional cleanup below, otherwise
+ComfyUI's own loaded models get folded into the "already in use" figure and the
+resulting reservation ends up far too large.
+"""
+
 import gc
-import time
 import random
 
-# Try to import pynvml; if missing, disable auto mode
-try:
-    import pynvml
-    pynvml.nvmlInit()
-    PYNVML_AVAILABLE = True
-except ImportError:
-    PYNVML_AVAILABLE = False
-    print("[PainterVRAM] Warning: pynvml not installed. Auto mode will be disabled.")
+from comfy import model_management
 
-# Save / restore random state for internal use
-_INITIAL_RANDOM_STATE = random.getstate()
-random.seed(time.time())
-_RESERVED_RANDOM_STATE = random.getstate()
-random.setstate(_INITIAL_RANDOM_STATE)
+GB = 1024 ** 3
+LOG = "[PainterVRAM]"
 
-def gpu_memory_info():
-    """Return (total_GB, used_GB) for GPU-0. None if unavailable."""
-    if not PYNVML_AVAILABLE:
-        return None, None
+# Private RNG so the refresh jitter never disturbs the global random stream.
+_jitter = random.Random()
+
+
+# ------------------------------------------------------------------ probing --
+
+_nvml = None
+_nvml_error = "not probed"
+
+
+def _probe_nvml():
+    """Import and initialise NVML, tolerating every failure mode.
+
+    Catching only ImportError is not enough here: a missing or mismatched
+    driver DLL can surface as OSError during import, and on a machine without
+    an NVIDIA card nvmlInit() raises its own error type. Either one would take
+    the whole node pack down at load time, so both steps stay guarded.
+    """
+    global _nvml, _nvml_error
     try:
-        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-        info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-        total = info.total / (1024 ** 3)
-        used  = info.used  / (1024 ** 3)
-        return total, used
-    except Exception as e:
-        print(f"[PainterVRAM] Failed to query GPU memory: {e}")
+        import pynvml
+    except Exception as exc:
+        _nvml_error = "import failed (%s)" % exc
+        return
+    try:
+        pynvml.nvmlInit()
+    except Exception as exc:
+        _nvml_error = "nvmlInit failed (%s)" % exc
+        return
+    _nvml = pynvml
+    _nvml_error = None
+
+
+_probe_nvml()
+
+
+def _read_gpu_mem():
+    """Return (total_gb, used_gb) for device 0, or (None, None) when unknown."""
+    if _nvml is not None:
+        try:
+            handle = _nvml.nvmlDeviceGetHandleByIndex(0)
+            info = _nvml.nvmlDeviceGetMemoryInfo(handle)
+            return info.total / GB, info.used / GB
+        except Exception as exc:
+            print("%s NVML query failed (%s), trying torch" % (LOG, exc))
+
+    try:
+        import torch
+        free, total = torch.cuda.mem_get_info()
+        return total / GB, (total - free) / GB
+    except Exception as exc:
+        print("%s no GPU memory source available (%s)" % (LOG, exc))
         return None, None
+
+
+# ------------------------------------------------------------------ writing --
+
+def _write_reserved(gb):
+    """Push the reservation into ComfyUI, and into DynamicVRAM when active.
+
+    model_management.extra_reserved_memory() re-reads the module global on
+    every call, so a plain assignment covers the classic budget and is the one
+    path with unambiguous units (bytes).
+
+    DynamicVRAM is the catch: it keeps its own headroom inside comfy-aimdo and
+    never looks at that global, so the assignment alone has no visible effect
+    while it is enabled. The comfy-aimdo value is in bytes too, and feeding
+    both is what ComfyUI itself does with --reserve-vram at boot.
+    """
+    reserved_bytes = int(max(0.0, gb) * GB)
+    model_management.EXTRA_RESERVED_VRAM = reserved_bytes
+
+    try:
+        from comfy import memory_management as comfy_mm
+        if not getattr(comfy_mm, "aimdo_enabled", False):
+            return
+
+        import comfy_aimdo.control as aimdo
+        if getattr(aimdo, "lib", None) is None:
+            return
+
+        aimdo.set_simple_vram_headroom(reserved_bytes)
+        print("%s DynamicVRAM headroom synced" % LOG)
+    except Exception as exc:
+        # EXTRA_RESERVED_VRAM is already written, so this is not fatal.
+        print("%s DynamicVRAM headroom not synced (%s)" % (LOG, exc))
+
+
+def _resolve_reserved(reserved, mode, auto_max):
+    """Turn the widget values into the GB figure that will actually be reserved."""
+    if mode != "auto":
+        gb = max(0.0, reserved)
+        print("%s manual reservation: %.2f GB" % (LOG, gb))
+        return gb
+
+    total, used = _read_gpu_mem()
+    if total is None:
+        gb = max(0.0, reserved)
+        print("%s auto unavailable, falling back to %.2f GB" % (LOG, gb))
+        return gb
+
+    gb = max(0.0, used + reserved)
+    if 0.0 < auto_max < gb:
+        print("%s auto result %.2f GB capped at %.2f GB" % (LOG, gb, auto_max))
+        gb = auto_max
+
+    print("%s auto reservation: %.2f GB (card %.2f GB, in use %.2f GB, margin %.2f GB)"
+          % (LOG, gb, total, used, reserved))
+    return gb
+
+
+# -------------------------------------------------------------------- node --
 
 class AlwaysEqualProxy(str):
     def __eq__(self, _):
         return True
+
     def __ne__(self, _):
         return False
 
+
 any_type = AlwaysEqualProxy("*")
 
+
 class PainterVRAM:
-    """Manage ComfyUI EXTRA_RESERVED_VRAM with manual or auto mode."""
+    """Reserve GPU memory headroom for other applications before a run."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -51,6 +155,7 @@ class PainterVRAM:
                 "reserved": ("FLOAT", {
                     "default": 0.6,
                     "min": -2.0,
+                    "max": 64.0,
                     "step": 0.1,
                     "display": "reserved (GB)"
                 }),
@@ -59,6 +164,19 @@ class PainterVRAM:
                     "display": "Mode"
                 }),
                 "clean_gpu_before": ("BOOLEAN", {"default": True}),
+                "auto_max": ("FLOAT", {
+                    "default": 0.0,
+                    "min": 0.0,
+                    "max": 64.0,
+                    "step": 0.1,
+                    "display": "auto cap (GB, 0 = off)"
+                }),
+                "seed": ("INT", {
+                    "default": 0,
+                    "min": -1,
+                    "max": 1125899906842624,
+                    "display": "seed (-1 = refresh every run)"
+                }),
             },
             "optional": {
                 "anything": (any_type, {})
@@ -69,61 +187,44 @@ class PainterVRAM:
             }
         }
 
-    RETURN_TYPES = (any_type,)
-    RETURN_NAMES = ("output",)
+    RETURN_TYPES = (any_type, "FLOAT")
+    RETURN_NAMES = ("output", "reserved_gb")
     OUTPUT_NODE = True
     FUNCTION = "apply"
     CATEGORY = "VRAM"
+    DESCRIPTION = ("Sets ComfyUI's extra VRAM reservation. Auto mode reserves "
+                   "whatever the GPU already uses plus the margin, so other "
+                   "applications keep their memory.")
 
-    @staticmethod
-    def force_cleanup():
-        """Aggressively free GPU memory."""
-        gc.collect()
-        model_management.unload_all_models()
-        model_management.soft_empty_cache()
+    @classmethod
+    def IS_CHANGED(cls, seed=0, **kwargs):
+        # Auto mode is derived from live VRAM usage, so a cached result goes
+        # stale as soon as anything else on the machine changes. A negative
+        # seed opts into recomputing on every run.
+        return _jitter.random() if seed < 0 else seed
 
     def apply(self, reserved, mode="auto", clean_gpu_before=True,
-              anything=None, unique_id=None, extra_pnginfo=None):
+              auto_max=0.0, seed=0, anything=None, unique_id=None,
+              extra_pnginfo=None):
         if clean_gpu_before:
-            print("[PainterVRAM] Pre-cleanup GPU memory...")
-            self.force_cleanup()
-            print("[PainterVRAM] GPU cleanup finished")
+            print("%s releasing cached GPU memory first" % LOG)
+            gc.collect()
+            model_management.unload_all_models()
+            model_management.soft_empty_cache()
 
-        final_reserved_gb = 0.0
-
-        if mode == "auto":
-            if PYNVML_AVAILABLE:
-                total, used = gpu_memory_info()
-                if total is not None and used is not None:
-                    auto_reserved = used + reserved
-                    auto_reserved = max(0.0, auto_reserved)
-                    print(f"[PainterVRAM] Set EXTRA_RESERVED_VRAM={auto_reserved:.2f} GB "
-                          f"(auto: total={total:.2f} GB, used={used:.2f} GB)")
-                    model_management.EXTRA_RESERVED_VRAM = int(auto_reserved * 1024 ** 3)
-                    final_reserved_gb = round(auto_reserved, 2)
-                else:
-                    print("[PainterVRAM] Auto query failed; fallback to manual value")
-                    model_management.EXTRA_RESERVED_VRAM = int(max(0.0, reserved) * 1024 ** 3)
-                    final_reserved_gb = round(max(0.0, reserved), 2)
-            else:
-                print("[PainterVRAM] pynvml unavailable; fallback to manual value")
-                model_management.EXTRA_RESERVED_VRAM = int(max(0.0, reserved) * 1024 ** 3)
-                final_reserved_gb = round(max(0.0, reserved), 2)
-        else:
-            # Manual mode
-            reserved = max(0.0, reserved)
-            model_management.EXTRA_RESERVED_VRAM = int(reserved * 1024 ** 3)
-            print(f"[PainterVRAM] Set EXTRA_RESERVED_VRAM={reserved:.2f} GB (manual)")
-            final_reserved_gb = round(reserved, 2)
+        gb = _resolve_reserved(reserved, mode, auto_max)
+        _write_reserved(gb)
+        print("%s EXTRA_RESERVED_VRAM = %.2f GB" % (LOG, gb))
 
         from comfy_execution.graph import ExecutionBlocker
-        output_value = anything if anything is not None else ExecutionBlocker(None)
-        return (output_value,)
+        output = anything if anything is not None else ExecutionBlocker(None)
+        return (output, round(gb, 2))
+
 
 NODE_CLASS_MAPPINGS = {
     "PainterVRAM": PainterVRAM
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "PainterVRAM": "Painter VRAM "
+    "PainterVRAM": "Painter VRAM"
 }

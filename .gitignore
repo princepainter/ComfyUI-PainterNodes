@@ -1,0 +1,6 @@
+# --- local junk that must never reach the repo ---
+__pycache__/
+*.py[cod]
+*.bak-*
+*副本*
+废弃/

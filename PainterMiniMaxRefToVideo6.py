@@ -1,4 +1,11 @@
-"""MiniMax H3 Reference to Video node v2 (internal reference image upload).
+"""MiniMax H3 Reference to Video node v6 (internal reference image upload, drag & drop).
+
+基于 v3 的优化版：
+  1. 参考图上传框支持直接拖拽图片文件放入（可多选、可拖到指定槽位替换）。
+  2. 去掉 width / height / length 三个输出端口（仍保留同名输入控件/端口）。
+  3. 前台提示词编辑器中的快捷标识显示与最终输出文本完全一致
+     （<Picture 1> / <d>[Chinese] 台词。</d> / [Shot 2] At 00:02.00），仅保留配色高亮，
+     方便直接从节点里框选复制出可直接复用的完整提示词。
 
 Prompt + reference images (uploaded internally) / videos / audio -> conditioning + AV latent.
 Reference tags: <Picture i> / <Video k> / <Audio j>.
@@ -161,16 +168,19 @@ def _load_uploaded_ref_image(file_info):
     return torch.from_numpy(arr).unsqueeze(0)
 
 
-class PainterMiniMaxRefToVideo3(io.ComfyNode):
-    """ref2va v3: prompt + internally uploaded reference images / external videos / audio -> conditioning + AV latent.
-    Adds a button-driven prompt-optimizer (Ollama HTTP API) and an "original prompt" view."""
+class PainterMiniMaxRefToVideo6(io.ComfyNode):
+    """ref2va v6: prompt + internally uploaded reference images / external videos / audio -> conditioning + AV latent.
+
+    v6 = v3 + drag & drop image upload + no width/height/length outputs +
+    WYSIWYG quick tags in the prompt editor.
+    """
 
     @classmethod
     def define_schema(cls):
         return io.Schema(
-            node_id="PainterMiniMaxRefToVideo3",
-            description="Reference conditioning for MiniMax H3 (v3: internal image upload + button-driven prompt optimizer). Use <Picture i> / <Video k> / <Audio j> tags when prompting.",
-            display_name="Painter MiniMax Ref To Video 3",
+            node_id="PainterMiniMaxRefToVideo6",
+            description="Reference conditioning for MiniMax H3 (v6: internal image upload with drag & drop, WYSIWYG quick tags, no width/height/length outputs). Use <Picture i> / <Video k> / <Audio j> tags when prompting.",
+            display_name="Painter MiniMax Ref To Video 6",
             category="model/conditioning/minimax",
             inputs=[
                 io.Clip.Input("clip"),
@@ -283,8 +293,6 @@ class PainterMiniMaxRefToVideo3(io.ComfyNode):
                 ),
             ],
             outputs=[
-                # 与 v6 对齐：只保留 positive / latent / prompt，
-                # 去掉 width / height / length 三个输出端口。
                 io.Conditioning.Output(display_name="positive"),
                 io.Latent.Output(),
                 io.String.Output(display_name="prompt"),
@@ -463,16 +471,20 @@ class PainterMiniMaxRefToVideo3(io.ComfyNode):
 
 
 NODE_CLASS_MAPPINGS = {
-    "PainterMiniMaxRefToVideo3": PainterMiniMaxRefToVideo3
+    "PainterMiniMaxRefToVideo6": PainterMiniMaxRefToVideo6
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "PainterMiniMaxRefToVideo3": "Painter MiniMax Ref To Video 3"
+    "PainterMiniMaxRefToVideo6": "Painter MiniMax Ref To Video 6"
 }
 
 
 # ============================================================================
-# /painter/optimize_prompt — Ollama prompt-optimizer route
+# /painter/optimize_prompt6 — Ollama prompt-optimizer route (v6 独立路由)
+#
+# 说明：v6 使用带 "6" 后缀的独立路由，避免与 v3 模块在同一 aiohttp 路由表上
+# 重复注册 POST /painter/optimize_prompt 而触发 "Added route will never be
+# executed" 之类的冲突。两个节点可以同时存在、各自独立工作。
 # ============================================================================
 
 import asyncio as _asyncio
@@ -644,9 +656,9 @@ def _register_optimizer_route():
     if getattr(_register_optimizer_route, "_registered", False):
         return True
 
-    executor = _ThreadPoolExecutor(max_workers=2, thread_name_prefix="painter-optimizer")
+    executor = _ThreadPoolExecutor(max_workers=2, thread_name_prefix="painter-optimizer6")
 
-    @routes.post("/painter/optimize_prompt")
+    @routes.post("/painter/optimize_prompt6")
     async def _optimize(request):
         try:
             payload = await request.json()
@@ -720,7 +732,7 @@ def _register_optimizer_route():
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)[:1000]}, status=500)
 
-    @routes.post("/painter/unload_ollama")
+    @routes.post("/painter/unload_ollama6")
     async def _unload(request):
         try:
             payload = await request.json()
@@ -756,4 +768,4 @@ try:
 except Exception:
     pass
 
-_threading.Thread(target=_wait_for_optimizer_route_ready, daemon=True, name="PainterOptimizeRoute").start()
+_threading.Thread(target=_wait_for_optimizer_route_ready, daemon=True, name="PainterOptimizeRoute6").start()

@@ -1,17 +1,20 @@
 import { app } from "../../../scripts/app.js";
 
 /* =====================================================================
-PainterAudioUpload - compact refined edition (v5)
+PainterAudioUpload - compact refined edition (v6)
 - value widgets fully hidden, no dead space, compact default size
 - RESIZE SAFE: never setSize from ResizeObserver callbacks (that caused
   the runaway "explosion"). While dragging we only relayout passively;
   the min-size floor is enforced ONCE on pointer-up when layout settled.
-- waveform green / preview green / trimmed yellow
+- waveform green / drag selection YELLOW / trimmed clip view yellow
 - double-click = reset selection, right-click = clear selection
 - scale-compensated drag coordinates (mouse == selection box)
 - waveform auto-grows when the node is dragged taller
-- NEW: the old loop button is now a RESTORE button - one click clears
-  all trim marks and writes trim_start=0 / trim_end=-1 (export = original)
+- NEW v6: the scissors button now enters "CLIP VIEW" - the waveform,
+  the time readout and the playback are all restricted to the selected
+  range, so you literally see (and hear) only the trimmed segment.
+  The RESTORE button leaves clip view and shows the full audio again.
+  trim_start / trim_end are still written, so the export matches.
 ===================================================================== */
 
 const NODE_CLASS = "PainterAudioUpload";
@@ -22,16 +25,19 @@ const PROP_TRIM_END = "pau_trim_end";
 
 /* ----------------------------- layout ----------------------------- */
 const NODE_WIDTH = 480;
-const WAVEFORM_H = 30;
+const NAMEFILE_H = 13;   // 顶部文件名条（很薄，几乎不占高度）
+const WAVEFORM_H = 26;
 const CTRLROW_H = 30;
-const GAP = 6;
+const GAP = 4;
 const PAD_X = 10;
-const PAD_Y = 6;
+const PAD_Y = 4;
 
 // 标题栏 + 输出("audio")行 的预留高度（仅用于初始默认尺寸估算）
 const CHROME = 54;
 
-const CONTENT_MIN_H = WAVEFORM_H + CTRLROW_H + GAP + PAD_Y * 2; // 78
+// 文件名条占用的高度，用压缩后的 spacing 抵消掉大部分，
+// 所以节点整体（尤其是默认高度）几乎不变
+const CONTENT_MIN_H = NAMEFILE_H + WAVEFORM_H + CTRLROW_H + GAP * 2 + PAD_Y * 2;
 const DEFAULT_HEIGHT = CONTENT_MIN_H + CHROME;                  // ~132
 const MIN_WIDTH = 320;
 const MIN_HEIGHT = DEFAULT_HEIGHT;
@@ -50,13 +56,30 @@ const C = {
     primaryStrong: "#10b981",
 
     wave: "#34d399",
+    waveTrimmed: "#38bdf8",
 
-    selectionBg: "rgba(52, 211, 153, 0.18)",
-    selectionBorder: "#34d399",
+    /* 鼠标拖拽框选 = 黄色（始终黄色） */
+    selectionBg: "rgba(250, 204, 21, 0.22)",
+    selectionBorder: "#facc15",
+    selectionLabelBg: "rgba(250, 204, 21, 0.24)",
+    selectionText: "#fde68a",
 
-    trimmedBg: "rgba(250, 204, 21, 0.20)",
-    trimmedBorder: "#facc15",
-    trimmedLabelBg: "rgba(250, 204, 21, 0.18)",
+    /* 播放头：始终高亮黄色 + 加粗，裁切前后都清晰可见 */
+    playhead: "#fde047",
+    playheadGlow: "rgba(250, 204, 21, 0.95)",
+    playheadWidth: 3,
+
+    /* 裁剪已确认：只显示片段视图 -> 波纹变亮蓝（更醒目） */
+    trimmedBg: "rgba(56, 189, 248, 0.16)",
+    trimmedBorder: "#38bdf8",
+    trimmedLabelBg: "rgba(56, 189, 248, 0.20)",
+    trimmedWave: "#38bdf8",
+    trimmedPlayhead: "#38bdf8",
+
+    /* 右上角时间段徽章：黄色，在蓝色波纹上才看得清 */
+    badgeBg: "rgba(250, 204, 21, 0.22)",
+    badgeBorder: "#facc15",
+    badgeText: "#fde047",
 
     textMuted: "rgba(255, 255, 255, 0.55)",
     text: "rgba(255, 255, 255, 0.92)",
@@ -79,6 +102,7 @@ const SVG = {
     speakerMute: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" fill="currentColor"/><line x1="22" y1="9" x2="16" y2="15"/><line x1="16" y1="9" x2="22" y2="15"/></svg>`,
     cut: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><line x1="20" y1="4" x2="8.12" y2="15.88"/><line x1="14.47" y1="14.48" x2="20" y2="20"/><line x1="8.12" y1="8.12" x2="12" y2="12"/></svg>`,
     recording: `<svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="6"/></svg>`,
+    music: `<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>`,
 };
 
 /* =====================================================================
@@ -235,6 +259,18 @@ app.registerExtension({
 });
 
 /* =====================================================================
+版本标识：改了代码却看不到效果时，先在浏览器控制台看这一行。
+如果版本号没变，说明浏览器用的是缓存里的旧 JS —— 需要强制刷新
+（Ctrl+Shift+R，或 F12 → Network → 勾选 Disable cache 后刷新）。
+===================================================================== */
+const PAU_VERSION = "v6.2 (yellow select / green->blue clip / tight top)";
+
+console.log(
+    "[PainterAudioUpload] " + PAU_VERSION + " loaded",
+    "| 文件名条贴顶、多余空间给波形；框选黄、裁剪后波纹亮蓝、播放头亮黄 3px"
+);
+
+/* =====================================================================
 Hide value widgets completely.
 ===================================================================== */
 function collapseWidget(node, name) {
@@ -360,7 +396,7 @@ function buildUI(node) {
         box-sizing: border-box;
         display: flex;
         flex-direction: column;
-        justify-content: center;
+        justify-content: flex-start;
         align-items: stretch;
         gap: ${GAP}px;
         padding: ${PAD_Y}px ${PAD_X}px;
@@ -382,6 +418,10 @@ function buildUI(node) {
 
     node.pau_container = container;
 
+    /* 顶部文件名条：放在波形上方，占用原本的空白，不额外撑高节点 */
+    const nameBar = buildNameBar(node);
+    container.appendChild(nameBar);
+
     const body = document.createElement("div");
     body.className = "pau-body";
     container.appendChild(body);
@@ -391,6 +431,7 @@ function buildUI(node) {
 
     node.pau_body = body;
     node.pau_controls = controls;
+    node.pau_nameBar = nameBar;
 
     if (window.ResizeObserver) {
         node.pau_resizeObserver = new ResizeObserver(() => passiveRelayout(node));
@@ -407,6 +448,94 @@ function buildUI(node) {
     } else {
         renderEmpty(node);
     }
+}
+
+/* =====================================================================
+顶部文件名条：波形上方的一行，显示当前音频文件名（过长省略，
+悬停可看全名）。高度很小，靠压缩间距腾出来，节点高度不增加。
+===================================================================== */
+function buildNameBar(node) {
+    const bar = document.createElement("div");
+    bar.className = "pau-namebar";
+    bar.style.cssText = `
+        width: 100%;
+        height: ${NAMEFILE_H}px;
+        box-sizing: border-box;
+        display: none;
+        align-items: center;
+        gap: 5px;
+        padding: 0 7px;
+        background: ${C.pill};
+        border: 1px solid ${C.pillBorder};
+        border-radius: 6px;
+        font-size: 9.5px;
+        line-height: 1;
+        white-space: nowrap;
+        overflow: hidden;
+        flex: 0 0 auto;
+    `;
+
+    const icon = document.createElement("span");
+    icon.innerHTML = SVG.music;
+    icon.style.cssText =
+        `display: flex; align-items: center; flex: 0 0 auto; ` +
+        `color: ${C.primary}; opacity: 0.9;`;
+
+    const text = document.createElement("span");
+    // min-width:0 是关键：flex 子项默认不会收缩，会导致文字溢出、省略号失效
+    text.style.cssText =
+        "flex: 1 1 auto; min-width: 0; overflow: hidden; " +
+        "text-overflow: ellipsis; white-space: nowrap; " +
+        "color: rgba(255,255,255,0.78);";
+    text.textContent = "";
+
+    bar.appendChild(icon);
+    bar.appendChild(text);
+
+    node.pau_nameText = text;
+    node.pau_nameIcon = icon;
+
+    return bar;
+}
+
+/* 文件名可能很长（还会带路径）：只留文件名本身，中间省略，
+   避免长名字把上方空间占满 */
+function prettifyAudioName(name) {
+    let s = String(name || "");
+    const parts = s.split(/[\\/]/);
+    if (parts.length > 1) s = parts[parts.length - 1];
+
+    const MAX = 34;
+    if (s.length <= MAX) return s;
+
+    const head = 17;
+    const tail = MAX - head - 1;
+
+    return s.slice(0, head) + "…" + s.slice(s.length - tail);
+}
+
+function updateNameBar(node) {
+    const bar = node.pau_nameBar;
+    const text = node.pau_nameText;
+    if (!bar || !text) return;
+
+    const name =
+        getRequiredWidgetValue(node, "audio_filename") ||
+        node.properties?.[PROP_FILENAME] ||
+        "";
+
+    if (!name) {
+        bar.style.display = "none";
+        return;
+    }
+
+    text.textContent = prettifyAudioName(name);
+    bar.title = name;
+    bar.style.display = "flex";
+}
+
+function hideNameBar(node) {
+    if (node.pau_nameBar) node.pau_nameBar.style.display = "none";
 }
 
 /* =====================================================================
@@ -560,6 +689,8 @@ function renderEmpty(node) {
     controls.style.display = "flex";
     controls.style.justifyContent = "center";
     container.style.justifyContent = "center";
+
+    hideNameBar(node);
 
     container.ondragover = (e) => e.preventDefault();
     container.ondragleave = () => {};
@@ -766,6 +897,12 @@ async function loadAndRender(node, filename) {
         isMuted: false,
     };
 
+    // 重开工作流时：如果 trim 区间还留着，就直接进入片段视图
+    const saved = readSavedTrim(node, audioBuf.duration);
+
+    setClipView(node, saved.start, saved.end);
+    node.pau_drawState = null;
+
     renderLoaded(node);
 }
 
@@ -792,7 +929,8 @@ function renderLoaded(node) {
     `;
 
     controls.style.display = "flex";
-    container.style.justifyContent = "center";
+    // 顶部对齐：文件名条紧贴上方，多余空间全部给波形，避免上方留白
+    container.style.justifyContent = "flex-start";
 
     const wfContainer = document.createElement("div");
     wfContainer.style.cssText = `
@@ -813,6 +951,28 @@ function renderLoaded(node) {
     const canvas = document.createElement("canvas");
     canvas.style.cssText = "width: 100%; height: 100%; display: block;";
     wfContainer.appendChild(canvas);
+
+    /* 选区之外变暗的遮罩：拖动时只改宽度，不重绘波形，所以不卡 */
+    const dimCss = `
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        left: 0;
+        width: 0;
+        display: none;
+        pointer-events: none;
+        background: rgba(0, 0, 0, 0.58);
+        z-index: 1;
+    `;
+
+    const dimLeft = document.createElement("div");
+    dimLeft.style.cssText = dimCss;
+
+    const dimRight = document.createElement("div");
+    dimRight.style.cssText = dimCss;
+
+    wfContainer.appendChild(dimLeft);
+    wfContainer.appendChild(dimRight);
 
     const selOverlay = document.createElement("div");
     selOverlay.style.cssText = `
@@ -835,8 +995,8 @@ function renderLoaded(node) {
         position: absolute;
         top: 2px;
         transform: translateX(-50%);
-        background: rgba(52, 211, 153, 0.20);
-        color: ${C.primary};
+        background: ${C.selectionLabelBg};
+        color: ${C.selectionText};
         font-size: 9px;
         font-weight: 500;
         padding: 1px 6px;
@@ -851,14 +1011,36 @@ function renderLoaded(node) {
     `;
     wfContainer.appendChild(selLabel);
 
+    /* 片段视图徽章：只显示裁剪后的片段时出现 */
+    const trimBadge = document.createElement("div");
+    trimBadge.style.cssText = `
+        position: absolute;
+        top: 2px;
+        right: 4px;
+        background: ${C.badgeBg};
+        color: ${C.badgeText};
+        font-size: 10px;
+        font-weight: 600;
+        text-shadow: 0 1px 2px rgba(0, 0, 0, 0.75);
+        padding: 1px 6px;
+        border-radius: 8px;
+        border: 1px solid ${C.badgeBorder};
+        display: none;
+        pointer-events: none;
+        white-space: nowrap;
+        font-variant-numeric: tabular-nums;
+        z-index: 3;
+    `;
+    wfContainer.appendChild(trimBadge);
+
     const playhead = document.createElement("div");
     playhead.style.cssText = `
         position: absolute;
         top: 0;
         bottom: 0;
-        width: 2px;
-        background: ${C.primaryStrong};
-        box-shadow: 0 0 6px ${C.primary};
+        width: ${C.playheadWidth}px;
+        background: ${C.playhead};
+        box-shadow: 0 0 8px ${C.playheadGlow};
         display: none;
         pointer-events: none;
         left: 0;
@@ -872,13 +1054,16 @@ function renderLoaded(node) {
     const refs = node.pau_refs;
     refs.wfContainer = wfContainer;
     refs.canvas = canvas;
+    refs.dimLeft = dimLeft;
+    refs.dimRight = dimRight;
     refs.selOverlay = selOverlay;
     refs.selLabel = selLabel;
+    refs.trimBadge = trimBadge;
     refs.playhead = playhead;
 
-    if (refs.tDur) refs.tDur.textContent = formatTime(node.pau_duration);
-
     showLoadedControls(node);
+    updateNameBar(node);
+    applyTrimTheme(node);
     setupWaveformInteraction(node);
     setupPlayback(node);
     startPlayheadLoop(node);
@@ -902,6 +1087,169 @@ function renderLoaded(node) {
     });
 }
 
+/* =====================================================================
+Clip view helpers.
+"viewStart / viewEnd" (seconds, absolute in the original file) define the
+window that is currently DISPLAYED. Full audio => [0, duration].
+After clicking the scissors => [selection.start, selection.end], so the
+waveform/time/playback all show only the trimmed segment.
+===================================================================== */
+function viewRange(node) {
+    const d = Math.max(0, node.pau_duration || 0);
+
+    let s = Number(node.pau_viewStart);
+    let e = Number(node.pau_viewEnd);
+
+    if (!isFinite(s) || s < 0) s = 0;
+    if (!isFinite(e) || e <= 0) e = d;
+
+    s = Math.max(0, Math.min(s, d));
+    e = Math.max(s + 0.001, Math.min(e, d > 0 ? d : s + 0.001));
+
+    return { start: s, end: e, span: Math.max(0.001, e - s) };
+}
+
+/* 当前是否处于"只显示裁剪片段"状态（由视图窗口推导，永远与画面一致） */
+function isClipped(node) {
+    const d = Math.max(0, node.pau_duration || 0);
+    if (d <= 0) return false;
+    const view = viewRange(node);
+    return view.start > 0.005 || view.end < d - 0.005;
+}
+
+/* trim_start / trim_end 隐藏在 widget 里；重开工作流时据此重建片段视图 */
+function readSavedTrim(node, duration) {
+    const d = Math.max(0, duration || 0);
+
+    let s = Number(getRequiredWidgetValue(node, "trim_start"));
+    if (!isFinite(s)) s = Number(node.properties?.[PROP_TRIM_START]);
+    if (!isFinite(s) || s < 0) s = 0;
+
+    let e = Number(getRequiredWidgetValue(node, "trim_end"));
+    if (!isFinite(e)) e = Number(node.properties?.[PROP_TRIM_END]);
+    if (!isFinite(e) || e < 0) e = d;
+
+    s = Math.max(0, Math.min(s, d));
+    e = Math.max(s, Math.min(e, d));
+
+    const active = e > s + 0.01 && (s > 0.005 || e < d - 0.005);
+
+    if (!active) return { start: 0, end: d, active: false };
+    return { start: s, end: e, active: true };
+}
+
+function setClipView(node, startAbs, endAbs) {
+    const d = Math.max(0, node.pau_duration || 0);
+
+    let s = Math.max(0, Math.min(startAbs, d));
+    let e = Math.max(s + 0.01, Math.min(endAbs, d));
+
+    node.pau_viewStart = s;
+    node.pau_viewEnd = e;
+    node.pau_drawState = null; // 强制按新窗口重画波形
+}
+
+function resetClipView(node) {
+    setClipView(node, 0, Math.max(0, node.pau_duration || 0));
+}
+
+/* 播放区间：有未确认的选区时只在选区内试听，否则跟着当前视图 */
+function playbackLimit(node) {
+    const view = viewRange(node);
+    const sel = node.pau_state?.selection;
+
+    if (!sel) return view;
+
+    const s = Math.max(view.start, sel.start);
+    const e = Math.min(view.end, sel.end);
+
+    if (e - s < 0.01) return view;
+    return { start: s, end: e, span: e - s };
+}
+
+/* 播放头 / 徽章 / 时长读数随"完整 or 片段"状态切换配色与数值 */
+function applyTrimTheme(node) {
+    const refs = node.pau_refs;
+    if (!refs) return;
+
+    const trimmed = isClipped(node);
+    const view = viewRange(node);
+
+    // 播放头恒定高亮黄色 + 加粗：绿色 / 蓝色波形上都足够醒目
+    if (refs.playhead) {
+        refs.playhead.style.width = `${C.playheadWidth}px`;
+        refs.playhead.style.background = C.playhead;
+        refs.playhead.style.boxShadow = `0 0 8px ${C.playheadGlow}`;
+    }
+
+    // 裁剪态：波形外圈加一道亮蓝描边，整块更醒目
+    if (refs.wfContainer) {
+        refs.wfContainer.style.outline = trimmed
+            ? "1px solid rgba(56, 189, 248, 0.45)"
+            : "1px solid rgba(255,255,255,0.06)";
+        refs.wfContainer.style.outlineOffset = "-1px";
+    }
+
+    if (refs.trimBadge) {
+        if (trimmed) {
+            refs.trimBadge.textContent =
+                "✂ " + view.start.toFixed(1) + "s – " + view.end.toFixed(1) +
+                "s · " + view.span.toFixed(1) + "s";
+            refs.trimBadge.style.display = "block";
+        } else {
+            refs.trimBadge.style.display = "none";
+        }
+    }
+
+    if (refs.tDur) refs.tDur.textContent = formatTime(view.span);
+}
+
+/* 点击剪刀：进入片段视图 + 写回 trim（导出即为该片段） */
+function applyTrimToView(node, startAbs, endAbs) {
+    const state = node.pau_state;
+    if (!state) return;
+
+    setClipView(node, startAbs, endAbs);
+
+    const view = viewRange(node);
+    const ts = Number(view.start.toFixed(3));
+    const te = Number(view.end.toFixed(3));
+
+    state.selection = null;
+
+    const ok1 = setRequiredWidget(node, "trim_start", ts);
+    const ok2 = setRequiredWidget(node, "trim_end", te);
+
+    node.properties[PROP_TRIM_START] = ts;
+    node.properties[PROP_TRIM_END] = te;
+
+    if (!ok1 || !ok2) {
+        console.warn(
+            "[PainterAudioUpload] could not write trim values back to the hidden " +
+            "widgets: clip view is correct visually but export may not be trimmed."
+        );
+    }
+
+    markGraphDirty(node);
+    try { app.graph?.afterChange?.(); } catch (e) {}
+
+    const audio = node.pau_audioElement;
+    if (audio) {
+        try { audio.pause(); } catch (e) {}
+        audio.currentTime = view.start;
+    }
+
+    relayoutWaveform(node);
+    node.pau_paintOverlay?.();
+    applyTrimTheme(node);
+    updateTrimVisuals(node);
+
+    console.log(
+        "[PainterAudioUpload] clip view: " +
+        view.start.toFixed(3) + "s -> " + view.end.toFixed(3) + "s"
+    );
+}
+
 function relayoutWaveform(node) {
     const refs = node.pau_refs;
     const wf = refs?.wfContainer;
@@ -913,14 +1261,30 @@ function relayoutWaveform(node) {
     const w = Math.max(60, Math.round(wf.clientWidth * dpr));
     const h = Math.max(24, Math.round(wf.clientHeight * dpr));
 
-    if (canvas.width !== w || canvas.height !== h) {
-        canvas.width = w;
-        canvas.height = h;
-        drawWaveform(canvas, node.pau_audioBuffer);
-    }
+    const view = viewRange(node);
+    const color = isClipped(node) ? C.trimmedWave : C.wave;
+
+    const prev = node.pau_drawState;
+    const changed =
+        !prev ||
+        prev.w !== w ||
+        prev.h !== h ||
+        prev.color !== color ||
+        Math.abs(prev.start - view.start) > 1e-6 ||
+        Math.abs(prev.end - view.end) > 1e-6;
+
+    if (!changed) return;
+
+    canvas.width = w;
+    canvas.height = h;
+
+    drawWaveform(canvas, node.pau_audioBuffer, view, color);
+
+    node.pau_drawState = { w, h, start: view.start, end: view.end, color };
 }
 
-function drawWaveform(canvas, audioBuf) {
+/* 只绘制 view 窗口内的采样 —— 这就是"只显示裁剪后的片段" */
+function drawWaveform(canvas, audioBuf, view, color) {
     const ctx = canvas.getContext("2d");
     const w = canvas.width;
     const h = canvas.height;
@@ -928,29 +1292,49 @@ function drawWaveform(canvas, audioBuf) {
     ctx.clearRect(0, 0, w, h);
 
     const numCh = audioBuf.numberOfChannels;
+    const sr = audioBuf.sampleRate || 1;
     const len = audioBuf.length;
     if (!len) return;
 
-    const samplesPerPixel = Math.max(1, Math.floor(len / w));
+    const range = view || { start: 0, end: len / sr, span: len / sr };
+
+    let s0 = Math.floor(range.start * sr);
+    let s1 = Math.ceil(range.end * sr);
+
+    s0 = Math.max(0, Math.min(s0, len - 1));
+    s1 = Math.max(s0 + 1, Math.min(s1, len));
+
+    const span = s1 - s0;
+    const samplesPerPixel = span / w;
     const mid = h / 2;
 
-    ctx.fillStyle = C.wave;
+    const channels = [];
+    for (let c = 0; c < numCh; c++) channels.push(audioBuf.getChannelData(c));
+
+    ctx.fillStyle = color || C.wave;
 
     for (let x = 0; x < w; x++) {
-        const start = x * samplesPerPixel;
-        const end = Math.min(len, start + samplesPerPixel);
+        let a = s0 + Math.floor(x * samplesPerPixel);
+        let b = s0 + Math.floor((x + 1) * samplesPerPixel);
+
+        if (b <= a) b = a + 1;
+        if (b > s1) b = s1;
+        if (a >= s1) break;
 
         let min = 1.0;
         let max = -1.0;
 
         for (let c = 0; c < numCh; c++) {
-            const data = audioBuf.getChannelData(c);
-            for (let i = start; i < end; i++) {
+            const data = channels[c];
+
+            for (let i = a; i < b; i++) {
                 const v = data[i];
                 if (v < min) min = v;
                 if (v > max) max = v;
             }
         }
+
+        if (max < min) { min = 0; max = 0; }
 
         const y1 = mid - max * (mid - 1);
         const y2 = mid - min * (mid - 1);
@@ -960,6 +1344,28 @@ function drawWaveform(canvas, audioBuf) {
 
     ctx.fillStyle = "rgba(255,255,255,0.18)";
     ctx.fillRect(0, mid, w, 1);
+}
+
+/* =====================================================================
+选区之外的暗化遮罩：只改样式，O(1)，拖动时不重绘波形
+===================================================================== */
+function paintDimMask(refs, L, R, localW) {
+    if (!refs?.dimLeft || !refs?.dimRight) return;
+
+    const l = Math.max(0, Math.min(L, localW));
+    const r = Math.max(l, Math.min(R, localW));
+
+    refs.dimLeft.style.display = "block";
+    refs.dimLeft.style.width = `${l}px`;
+
+    refs.dimRight.style.display = "block";
+    refs.dimRight.style.left = `${r}px`;
+    refs.dimRight.style.width = `${Math.max(0, localW - r)}px`;
+}
+
+function hideDimMask(refs) {
+    if (refs?.dimLeft) refs.dimLeft.style.display = "none";
+    if (refs?.dimRight) refs.dimRight.style.display = "none";
 }
 
 /* =====================================================================
@@ -987,11 +1393,18 @@ function setupWaveformInteraction(node) {
         return { rect, localW, scale: scale || 1 };
     };
 
+    /* 像素 -> 时间：时间落在当前视图窗口内（片段视图下即片段内部） */
     const posToTime = (e) => {
         const { rect, localW, scale } = getMetrics();
+        const view = viewRange(node);
         const x = Math.max(0, Math.min((e.clientX - rect.left) / scale, localW));
-        const t = node.pau_duration > 0 ? (x / localW) * node.pau_duration : 0;
-        return { x, t };
+        return { x, t: view.start + (x / localW) * view.span };
+    };
+
+    const timeToX = (t) => {
+        const { localW } = getMetrics();
+        const view = viewRange(node);
+        return ((t - view.start) / view.span) * localW;
     };
 
     const onPointerDown = (e) => {
@@ -1007,10 +1420,9 @@ function setupWaveformInteraction(node) {
         moved = false;
         dragging = null;
 
-        if (state.selection && node.pau_duration > 0) {
-            const { localW } = getMetrics();
-            const sl = (state.selection.start / node.pau_duration) * localW;
-            const sr = (state.selection.end / node.pau_duration) * localW;
+        if (state.selection) {
+            const sl = timeToX(state.selection.start);
+            const sr = timeToX(state.selection.end);
 
             if (Math.abs(p.x - sl) <= 6) { dragging = "left"; return; }
             if (Math.abs(p.x - sr) <= 6) { dragging = "right"; return; }
@@ -1028,10 +1440,9 @@ function setupWaveformInteraction(node) {
             if (!moved && Math.abs(p.x - downX) > 3) {
                 moved = true;
                 dragging = "new";
-                dragAnchor = (downX / (getMetrics().localW || 1)) * node.pau_duration;
+                dragAnchor = p.t;
 
                 state.selection = { start: dragAnchor, end: dragAnchor };
-                state.trimmed = false;
                 updateTrimVisuals(node);
                 paintOverlay();
             } else {
@@ -1050,7 +1461,6 @@ function setupWaveformInteraction(node) {
             state.selection.end = Math.max(p.t, state.selection.start + 0.05);
         }
 
-        state.trimmed = false;
         updateTrimVisuals(node);
         paintOverlay();
     };
@@ -1058,11 +1468,11 @@ function setupWaveformInteraction(node) {
     const endDrag = (e) => {
         dragging = null;
         try { container.releasePointerCapture(e.pointerId); } catch (err) {}
+        updateTrimVisuals(node);
     };
 
     const clearSelection = () => {
         state.selection = null;
-        state.trimmed = false;
         updateTrimVisuals(node);
         paintOverlay();
     };
@@ -1100,32 +1510,38 @@ function setupWaveformInteraction(node) {
         if (!state.selection || node.pau_duration <= 0) {
             overlay.style.display = "none";
             label.style.display = "none";
+            hideDimMask(refs);
             updateTrimVisuals(node);
             return;
         }
 
         const { localW } = getMetrics();
 
-        const sl = (state.selection.start / node.pau_duration) * localW;
-        const sr = (state.selection.end / node.pau_duration) * localW;
+        const sl = timeToX(state.selection.start);
+        const sr = timeToX(state.selection.end);
 
-        overlay.style.left = `${sl}px`;
-        overlay.style.width = `${Math.max(0, sr - sl)}px`;
+        const L = Math.max(0, Math.min(sl, localW));
+        const R = Math.max(0, Math.min(sr, localW));
+
+        overlay.style.left = `${L}px`;
+        overlay.style.width = `${Math.max(0, R - L)}px`;
         overlay.style.display = "block";
 
-        const trimmed = !!state.trimmed;
+        // 拖拽框选 = 黄色，1px 细边框
+        overlay.style.background = C.selectionBg;
+        overlay.style.boxShadow = `inset 0 0 0 1px ${C.selectionBorder}`;
 
-        overlay.style.background = trimmed ? C.trimmedBg : C.selectionBg;
-        overlay.style.boxShadow = `inset 0 0 0 2px ${trimmed ? C.trimmedBorder : C.selectionBorder}`;
+        // 选区之外变暗，突出选中内容
+        paintDimMask(refs, L, R, localW);
 
-        label.style.background = trimmed ? C.trimmedLabelBg : "rgba(52, 211, 153, 0.20)";
-        label.style.color = trimmed ? C.trimmedBorder : C.primary;
-        label.style.borderColor = trimmed ? C.trimmedBorder : C.selectionBorder;
+        label.style.background = C.selectionLabelBg;
+        label.style.color = C.selectionText;
+        label.style.borderColor = C.selectionBorder;
 
         const dur = state.selection.end - state.selection.start;
         label.textContent = dur.toFixed(1) + "s";
 
-        const cx = (sl + sr) / 2;
+        const cx = (L + R) / 2;
         const half = 22;
         label.style.left = `${Math.max(half, Math.min(cx, localW - half))}px`;
         label.style.display = "block";
@@ -1166,25 +1582,36 @@ function startPlayheadLoop(node) {
 
         const refs = node.pau_refs;
         const audio = node.pau_audioElement;
-        const state = node.pau_state || {};
+        const view = viewRange(node);
+        const lim = playbackLimit(node);
 
         const t = audio.currentTime || 0;
 
-        // 播放限制在选区内：到选区末端自动暂停
-        if (state.selection && !audio.paused && t >= state.selection.end - 0.01) {
-            audio.pause();
-            audio.currentTime = state.selection.end;
+        // 播放被限制在当前区间（选区内试听 / 片段视图内），绝不放出去
+        if (!audio.paused) {
+            if (t >= lim.end - 0.01) {
+                audio.pause();
+                audio.currentTime = lim.end;
+            } else if (t < lim.start - 0.05) {
+                audio.currentTime = lim.start;
+            }
         }
 
-        if (refs.tCur) refs.tCur.textContent = formatTime(t);
+        // 时间读数 = 相对当前视图的位置（片段视图下 0 就是片段开头）
+        if (refs.tCur) {
+            const rel = Math.max(0, Math.min(t - view.start, view.span));
+            refs.tCur.textContent = formatTime(rel);
+        }
 
         const playhead = refs.playhead;
         if (playhead && playhead.parentElement) {
             const w = playhead.parentElement.clientWidth || 1;
-            const frac = node.pau_duration > 0 ? t / node.pau_duration : 0;
+            const shown = audio.currentTime || 0;
+            const frac = Math.max(0, Math.min((shown - view.start) / view.span, 1));
 
             playhead.style.left = `${frac * w}px`;
-            playhead.style.display = audio.paused && t === 0 ? "none" : "block";
+            playhead.style.display =
+                audio.paused && shown <= view.start + 0.001 ? "none" : "block";
         }
 
         node.pau_rafId = requestAnimationFrame(tick);
@@ -1230,15 +1657,13 @@ function setupControls(node) {
         const audio = node.pau_audioElement;
         if (!audio) return;
 
-        const state = node.pau_state;
+        const lim = playbackLimit(node);
 
         if (audio.paused) {
-            if (state && state.selection) {
-                const cur = audio.currentTime || 0;
+            const cur = audio.currentTime || 0;
 
-                if (cur < state.selection.start || cur >= state.selection.end) {
-                    audio.currentTime = state.selection.start;
-                }
+            if (cur < lim.start || cur >= lim.end - 0.005) {
+                audio.currentTime = lim.start;
             }
 
             audio.play().catch(() => {});
@@ -1252,6 +1677,7 @@ function setupControls(node) {
         restoreOriginal(node);
     };
 
+    /* 剪刀 = 只保留框选的片段：波形 / 时间 / 播放全部只显示该片段 */
     cutBtn.onclick = (e) => {
         e.stopPropagation();
 
@@ -1259,30 +1685,18 @@ function setupControls(node) {
         if (!state) return;
 
         if (!state.selection) {
-            state.selection = { start: 0, end: node.pau_duration || 0 };
+            // 没有框选：已经是片段视图就无需操作；完整音频则整段保留（等于没裁）
+            if (!isClipped(node)) return;
+            const view = viewRange(node);
+            state.selection = { start: view.start, end: view.end };
         }
 
-        const ts = Number(state.selection.start.toFixed(3));
-        const te = Number(state.selection.end.toFixed(3));
+        const startAbs = state.selection.start;
+        const endAbs = state.selection.end;
 
-        const ok1 = setRequiredWidget(node, "trim_start", ts);
-        const ok2 = setRequiredWidget(node, "trim_end", te);
+        if (endAbs - startAbs < 0.05) return;
 
-        node.properties[PROP_TRIM_START] = ts;
-        node.properties[PROP_TRIM_END] = te;
-
-        markGraphDirty(node);
-
-        try { app.graph?.afterChange?.(); } catch (e) {}
-
-        state.trimmed = true;
-
-        if (node.pau_paintOverlay) node.pau_paintOverlay();
-        updateTrimVisuals(node);
-
-        if (!ok1 || !ok2) {
-            alert("Failed to save trim values to widgets.");
-        }
+        applyTrimToView(node, startAbs, endAbs);
     };
 
     uploadBtn.onclick = (e) => {
@@ -1296,13 +1710,12 @@ function setupControls(node) {
     };
 }
 
-/* one click = remove every trim operation/mark, export = original audio */
+/* one click = leave clip view, clear every trim mark, export = original audio */
 function restoreOriginal(node) {
     const state = node.pau_state;
-    if (state) {
-        state.selection = null;
-        state.trimmed = false;
-    }
+    if (state) state.selection = null;
+
+    resetClipView(node);
 
     setRequiredWidget(node, "trim_start", 0.0);
     setRequiredWidget(node, "trim_end", -1.0);
@@ -1314,22 +1727,42 @@ function restoreOriginal(node) {
 
     try { app.graph?.afterChange?.(); } catch (e) {}
 
+    const audio = node.pau_audioElement;
+    if (audio) {
+        try { audio.pause(); } catch (e) {}
+        audio.currentTime = 0;
+    }
+
+    relayoutWaveform(node);
     node.pau_paintOverlay?.();
+    applyTrimTheme(node);
     updateTrimVisuals(node);
 
-    console.log("[PainterAudioUpload] restored original: trim cleared (0 / -1)");
+    console.log("[PainterAudioUpload] restored full audio: trim cleared (0 / -1)");
 }
 
 function updateTrimVisuals(node) {
     const refs = node.pau_refs;
-    const state = node.pau_state;
-
     if (!refs?.cutBtn) return;
 
-    const trimmed = !!(state && state.trimmed);
+    const clipped = isClipped(node);
+    const hasSel = !!node.pau_state?.selection;
 
-    refs.cutBtn.style.color = trimmed ? C.trimmedBorder : C.text;
-    refs.cutBtn.title = trimmed ? "Trim confirmed" : "Confirm trim";
+    refs.cutBtn.style.color = clipped
+        ? C.trimmedBorder
+        : (hasSel ? C.selectionBorder : C.text);
+
+    refs.cutBtn.style.opacity = (clipped || hasSel) ? "1" : "0.55";
+
+    refs.cutBtn.title = clipped
+        ? "Cut again: keep only the newly selected range"
+        : "Cut: show only the selected range";
+
+    if (refs.restoreBtn) {
+        refs.restoreBtn.style.color = clipped ? C.primary : C.text;
+        refs.restoreBtn.style.opacity = clipped ? "1" : "0.55";
+        refs.restoreBtn.title = "Restore full audio (exit clip view)";
+    }
 }
 
 /* =====================================================================
@@ -1502,6 +1935,9 @@ function clearAudio(node) {
 
     node.pau_audioBuffer = null;
     node.pau_duration = 0;
+
+    resetClipView(node);
+    node.pau_drawState = null;
 
     node.pau_state = {
         selection: null,

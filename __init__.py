@@ -6,12 +6,6 @@ def _register_module(module):
     NODE_DISPLAY_NAME_MAPPINGS.update(getattr(module, "NODE_DISPLAY_NAME_MAPPINGS", {}))
 
 try:
-    from . import PainterPrompt
-    _register_module(PainterPrompt)
-except Exception as e:
-    print(f"[PainterNodes] Failed to import PainterPrompt: {e}")
-
-try:
     from . import PainterI2V
     _register_module(PainterI2V)
 except Exception as e:
@@ -22,18 +16,6 @@ try:
     _register_module(PainterI2VAdvanced)
 except Exception as e:
     print(f"[PainterNodes] Failed to import PainterI2VAdvanced: {e}")
-
-try:
-    from . import PainterAI2V
-    _register_module(PainterAI2V)
-except Exception as e:
-    print(f"[PainterNodes] Failed to import PainterAI2V: {e}")
-
-try:
-    from . import PainterAV2V
-    _register_module(PainterAV2V)
-except Exception as e:
-    print(f"[PainterNodes] Failed to import PainterAV2V: {e}")
 
 try:
     from . import PainterVideoCombine
@@ -48,28 +30,10 @@ except Exception as e:
     print(f"[PainterNodes] Failed to import PainterVideoInfo: {e}")
 
 try:
-    from . import PainterVideoUpscale
-    _register_module(PainterVideoUpscale)
-except Exception as e:
-    print(f"[PainterNodes] Failed to import PainterVideoUpscale: {e}")
-
-try:
     from . import PainterVRAM
     _register_module(PainterVRAM)
 except Exception as e:
     print(f"[PainterNodes] Failed to import PainterVRAM: {e}")
-
-try:
-    from . import PainterStringCleaner
-    _register_module(PainterStringCleaner)
-except Exception as e:
-    print(f"[PainterNodes] Failed to import PainterStringCleaner: {e}")
-
-try:
-    from . import PainterFrameRateConverter
-    _register_module(PainterFrameRateConverter)
-except Exception as e:
-    print(f"[PainterNodes] Failed to import PainterFrameRateConverter: {e}")
 
 try:
     from . import PainterFrameExtractor
@@ -82,12 +46,6 @@ try:
     _register_module(PainterLTX2Vomni)
 except Exception as e:
     print(f"[PainterNodes] Failed to import PainterLTX2Vomni: {e}")
-
-try:
-    from . import PainterLTXomni2
-    _register_module(PainterLTXomni2)
-except Exception as e:
-    print(f"[PainterNodes] Failed to import PainterLTXomni2: {e}")
 
 try:
     from . import PainterV2AV
@@ -126,52 +84,16 @@ except Exception as e:
     print(f"[PainterNodes] Failed to import PainterAudioCut: {e}")
 
 try:
-    from . import PainterBerniniUpscale
-    _register_module(PainterBerniniUpscale)
-except Exception as e:
-    print(f"[PainterNodes] Failed to import PainterBerniniUpscale: {e}")
-
-try:
-    from . import PainterCombineFromBatch
-    _register_module(PainterCombineFromBatch)
-except Exception as e:
-    print(f"[PainterNodes] Failed to import PainterCombineFromBatch: {e}")
-
-try:
     from . import PainterFLF2V
     _register_module(PainterFLF2V)
 except Exception as e:
     print(f"[PainterNodes] Failed to import PainterFLF2V: {e}")
 
 try:
-    from . import PainterHumoAI2V
-    _register_module(PainterHumoAI2V)
-except Exception as e:
-    print(f"[PainterNodes] Failed to import PainterHumoAI2V: {e}")
-
-try:
-    from . import PainterHumoAV2V
-    _register_module(PainterHumoAV2V)
-except Exception as e:
-    print(f"[PainterNodes] Failed to import PainterHumoAV2V: {e}")
-
-try:
     from . import PainterImageFromBatch
     _register_module(PainterImageFromBatch)
 except Exception as e:
     print(f"[PainterNodes] Failed to import PainterImageFromBatch: {e}")
-
-try:
-    from . import PainterLongVideo
-    _register_module(PainterLongVideo)
-except Exception as e:
-    print(f"[PainterNodes] Failed to import PainterLongVideo: {e}")
-
-try:
-    from . import PainterS2Vplus
-    _register_module(PainterS2Vplus)
-except Exception as e:
-    print(f"[PainterNodes] Failed to import PainterS2Vplus: {e}")
 
 try:
     from . import PainterTextOverlay
@@ -197,25 +119,17 @@ try:
 except Exception as e:
     print(f"[PainterNodes] Failed to import PainterMiniMaxRefToVideo3: {e}")
 
+try:
+    from . import PainterMiniMaxRefToVideo6
+    _register_module(PainterMiniMaxRefToVideo6)
+except Exception as e:
+    print(f"[PainterNodes] Failed to import PainterMiniMaxRefToVideo6: {e}")
 
 try:
     from . import PainterMinimaxH3LatentUpscaler
     _register_module(PainterMinimaxH3LatentUpscaler)
 except Exception as e:
     print(f"[PainterNodes] Failed to import PainterMinimaxH3LatentUpscaler: {e}")
-
-try:
-    from . import MiniMaxH3Turbo
-    _register_module(MiniMaxH3Turbo)
-except Exception as e:
-    print(f"[PainterNodes] Failed to import MiniMaxH3Turbo: {e}")
-
-try:
-    from . import PainterPromptRewriter
-    _register_module(PainterPromptRewriter)
-except Exception as e:
-    print(f"[PainterNodes] Failed to import PainterPromptRewriter: {e}")
-
 
 try:
     from . import PainterAudioUpload
@@ -229,9 +143,17 @@ try:
 except Exception as e:
     print(f"[PainterNodes] Failed to import PainterAudioMask: {e}")
 
+try:
+    from . import PainterSigmasGraph
+    _register_module(PainterSigmasGraph)
+except Exception as e:
+    print(f"[PainterNodes] Failed to import PainterSigmasGraph: {e}")
+
+
+
 print(f"\033[92m[PainterNodes] Loaded {len(NODE_CLASS_MAPPINGS)} nodes successfully!\033[0m")
 
-__version__ = "1.4.1"
+__version__ = "1.4.2"
 WEB_DIRECTORY = "./web/js"
 
 __all__ = [
