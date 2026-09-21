@@ -78,6 +78,12 @@ except Exception as e:
     print(f"[PainterNodes] Failed to import PainterQwenImageEdit: {e}")
 
 try:
+    from . import PainterQwenImage21
+    _register_module(PainterQwenImage21)
+except Exception as e:
+    print(f"[PainterNodes] Failed to import PainterQwenImage21: {e}")
+
+try:
     from . import PainterAudioCut
     _register_module(PainterAudioCut)
 except Exception as e:
@@ -153,7 +159,7 @@ except Exception as e:
 
 print(f"\033[92m[PainterNodes] Loaded {len(NODE_CLASS_MAPPINGS)} nodes successfully!\033[0m")
 
-__version__ = "1.4.2"
+__version__ = "1.4.3"
 WEB_DIRECTORY = "./web/js"
 
 __all__ = [
