@@ -66,6 +66,12 @@ except Exception as e:
     print(f"[PainterNodes] Failed to import PainterResizeImages: {e}")
 
 try:
+    from . import PainterSizeSettings
+    _register_module(PainterSizeSettings)
+except Exception as e:
+    print(f"[PainterNodes] Failed to import PainterSizeSettings: {e}")
+
+try:
     from . import PainterFluxImageEdit
     _register_module(PainterFluxImageEdit)
 except Exception as e:
@@ -159,7 +165,7 @@ except Exception as e:
 
 print(f"\033[92m[PainterNodes] Loaded {len(NODE_CLASS_MAPPINGS)} nodes successfully!\033[0m")
 
-__version__ = "1.4.3"
+__version__ = "1.4.4"
 WEB_DIRECTORY = "./web/js"
 
 __all__ = [
