@@ -15,6 +15,10 @@ PainterMiniMaxRefToVideo6.js  （基于 v3 的优化版）
   4. 新增 ⧉ 复制按钮：一键复制最终提示词到剪贴板。
   5. 粘贴 / 回填时能识别 <Picture N>、<d>…</d>、[Shot N] At MM:SS.ff
      以及旧格式 @图片N、【…】、切镜N，统一还原成彩色块。
+  6. v6.1 新增【拖拽重排】：按住已上传的参考图缩略图拖动，可改变它们在
+     <Picture i> 中的顺序（拖到目标槽位松手，其余图片顺次补位）。
+     用 pointer 事件自实现（原生 dragstart 会被槽位自己的 pointerdown
+     preventDefault 掐掉），与「拖文件进来上传」互不干扰。
 ================================================================ */
 const NODE_CLASS = "PainterMiniMaxRefToVideo6";
 const STYLE_ID = "mmr6-styles";
@@ -503,6 +507,165 @@ function attachImageDropTarget(el, onFiles) {
     });
 }
 
+/* ================================================================
+v6.1：已上传参考图 —— 按住缩略图拖拽，调整 <Picture i> 的顺序
+================================================================
+为什么不用 HTML5 原生 dragstart：
+  槽位自己的 pointerdown 里调了 preventDefault()（阻止事件冒泡到画布，
+  否则拖动图片会连带拖动整个节点），而这会连原生拖拽一起掐掉。
+  所以这里用 pointer 事件自实现一套，和「拖文件进来上传」互不冲突。
+================================================================ */
+const REORDER_GHOST_CLASS = "mmr-ref-reorder-ghost";
+const REORDER_SOURCE_CLASS = "is-reorder-source";
+const REORDER_TARGET_CLASS = "is-reorder-target";
+const REORDER_BODY_CLASS = "mmr-reordering";
+const REORDER_THRESHOLD_PX = 5;
+
+/* 命中鼠标下方的槽位（只认本节点的上传区，画布上可能有多个同类节点） */
+function getSlotElementAt(node, x, y) {
+    const el = document.elementFromPoint?.(x, y);
+    const slot = el?.closest?.(".mmr-ref-slot");
+    if (!slot) return null;
+    if (!node.__mmrRefUploadArea?.contains?.(slot)) return null;
+    return slot;
+}
+
+function clearReorderHighlights() {
+    document
+        .querySelectorAll?.(`.${REORDER_SOURCE_CLASS}, .${REORDER_TARGET_CLASS}`)
+        ?.forEach((el) => el.classList.remove(REORDER_SOURCE_CLASS, REORDER_TARGET_CLASS));
+}
+
+/* 跟随光标的浮动缩略图（挂在 body 上，避免被槽位 overflow:hidden 裁掉） */
+function makeReorderGhost(slot, startX, startY) {
+    const rect = slot.getBoundingClientRect();
+    const ghost = document.createElement("div");
+    ghost.className = REORDER_GHOST_CLASS;
+    ghost.style.width = `${rect.width}px`;
+    ghost.style.height = `${rect.height}px`;
+    ghost.style.left = `${rect.left}px`;
+    ghost.style.top = `${rect.top}px`;
+
+    const img = slot.querySelector("img");
+    if (img) {
+        const clone = img.cloneNode(true);
+        clone.draggable = false;
+        ghost.append(clone);
+    }
+    document.body.append(ghost);
+
+    return {
+        ghost,
+        offsetX: startX - rect.left,
+        offsetY: startY - rect.top,
+    };
+}
+
+/* 拖拽结束后紧跟而来的 click 要吃掉，否则松手会弹出「选择文件」对话框 */
+function suppressSlotClick(node) {
+    node.__mmrSuppressSlotClick = true;
+    setTimeout(() => {
+        node.__mmrSuppressSlotClick = false;
+    }, 0);
+}
+
+/* 把 fromIndex 位置的图挪到 toIndex 槽位，其余图片顺次补位。
+   例：[A,B,C,D] 把 A 拖到 C 的格子 → [B,C,A,D]（A 占据原 C 的格子）。 */
+function reorderRefImages(node, fromIndex, toIndex) {
+    const list = getRefImageFiles(node).filter((f) => f?.filename);
+    if (fromIndex < 0 || fromIndex >= list.length) return false;
+    if (toIndex < 0 || toIndex === fromIndex) return false;
+
+    const [moved] = list.splice(fromIndex, 1);
+    list.splice(Math.min(toIndex, list.length), 0, moved);
+
+    setRefImageFiles(node, list);
+    renderRefUploadArea(node);
+    repairNodeLayout(node);
+    return true;
+}
+
+function startSlotReorder(node, slot, fromIndex, downEvent) {
+    if (node.__mmrReorderActive) return;
+    node.__mmrReorderActive = true;
+
+    const pointerId = downEvent.pointerId;
+    const startX = downEvent.clientX;
+    const startY = downEvent.clientY;
+    let drag = null; // { ghost, offsetX, offsetY }
+    let targetSlot = null;
+
+    const teardown = () => {
+        window.removeEventListener("pointermove", onMove, true);
+        window.removeEventListener("pointerup", onUp, true);
+        window.removeEventListener("pointercancel", onCancel, true);
+        document.body.classList.remove(REORDER_BODY_CLASS);
+        clearReorderHighlights();
+        drag?.ghost?.remove();
+        drag = null;
+        targetSlot = null;
+        node.__mmrReorderActive = false;
+    };
+
+    const onMove = (event) => {
+        if (event.pointerId !== pointerId) return;
+
+        // 超过阈值才真正进入拖拽，否则仍算一次普通点击（点一下=换图）
+        if (!drag) {
+            if (Math.hypot(event.clientX - startX, event.clientY - startY) < REORDER_THRESHOLD_PX) {
+                return;
+            }
+            drag = makeReorderGhost(slot, startX, startY);
+            slot.classList.add(REORDER_SOURCE_CLASS);
+            document.body.classList.add(REORDER_BODY_CLASS);
+        }
+
+        event.preventDefault();
+        drag.ghost.style.left = `${event.clientX - drag.offsetX}px`;
+        drag.ghost.style.top = `${event.clientY - drag.offsetY}px`;
+
+        const over = getSlotElementAt(node, event.clientX, event.clientY);
+        const next = over && over !== slot ? over : null;
+        if (next !== targetSlot) {
+            targetSlot?.classList.remove(REORDER_TARGET_CLASS);
+            next?.classList.add(REORDER_TARGET_CLASS);
+            targetSlot = next;
+        }
+    };
+
+    const onUp = (event) => {
+        if (event.pointerId !== pointerId) return;
+        const dragging = Boolean(drag);
+        const toIndex = targetSlot ? Number(targetSlot.dataset.slotIndex) : null;
+        teardown();
+
+        if (!dragging) return; // 只是点了一下 → 交给原来的 click 逻辑
+        suppressSlotClick(node);
+        if (toIndex == null || Number.isNaN(toIndex)) return;
+        reorderRefImages(node, fromIndex, toIndex);
+    };
+
+    const onCancel = (event) => {
+        if (event.pointerId !== pointerId) return;
+        teardown();
+    };
+
+    window.addEventListener("pointermove", onMove, { capture: true, passive: false });
+    window.addEventListener("pointerup", onUp, true);
+    window.addEventListener("pointercancel", onCancel, true);
+}
+
+/* 给「已有图片」的槽位挂上拖拽重排（空槽位保持原样：点击上传 / 接收拖入的文件） */
+function installSlotReorder(node, slot, fromIndex) {
+    slot.classList.add("is-reorderable");
+    slot.title = `${slot.title || "点击换图"}（按住拖动可调整顺序）`;
+    slot.addEventListener("pointerdown", (event) => {
+        if (event.button !== 0) return;
+        if (event.target.closest(".mmr-ref-slot-remove")) return;
+        startSlotReorder(node, slot, fromIndex, event);
+    });
+}
+
 function renderRefUploadArea(node) {
     const area = node.__mmrRefUploadArea;
     if (!area) return;
@@ -574,6 +737,57 @@ function renderRefUploadArea(node) {
     controls.append(addBtn);
 
     area.append(controls);
+
+    // 行数变化后，DOM widget 分到的高度往往小于上传区真实需要的高度，
+    // 而 wrap 是 overflow:hidden —— 下方槽位会被裁掉（看不见、鼠标点不到、
+    // 也拖不进去）。这里延后测量一次，把节点高度补到够用。
+    scheduleUploadAreaFit(node);
+}
+
+/* ================================================================
+上传区高度自校正
+================================================================
+背景（2026-09-22 无头浏览器实测）：
+  rows=2 时上传区内容需要 166px，但 dom-widget / wrap 只分到 135px，
+  wrap 又是 overflow:hidden → 第二行槽位被裁在可视区外。
+  症状：第 2/3 行的参考图既看不到、也点不到、更拖不进去，
+  「拖拽改顺序」只能在第一行内生效。
+
+机制（实验数据）：节点高度 458→658 时，wrap 高度 45→135，
+  比例约 0.45（不是 1:1），所以没法一次算准 —— 用「量一次、补一次、
+  再量」的迭代收敛，最多 6 轮（每轮亏空至少减半，很快收敛）。
+  迭代天然幂等：够用就立刻返回，不会无限长高。
+================================================================ */
+function ensureUploadAreaHeight(node, attempt = 0) {
+    if (!node || node.__mmrRemoved || attempt > 6) return;
+    const area = node.__mmrRefUploadArea;
+    const wrap = area?.parentElement;
+    if (!area || !wrap || !area.isConnected) return;
+
+    const need = Math.ceil(area.getBoundingClientRect().height);
+    const have = Math.ceil(wrap.getBoundingClientRect().height);
+    if (need <= 0 || have <= 0 || have >= need) return; // 已经够用
+
+    const curW = Math.ceil(node.size?.[0] || DEFAULT_NODE_SIZE[0]);
+    const curH = Math.ceil(node.size?.[1] || DEFAULT_NODE_SIZE[1]);
+    const nextH = Math.min(4000, curH + (need - have));
+    if (nextH <= curH + 2) return;
+
+    node.setSize?.([curW, nextH]);
+    writeNodeSize(node, [curW, nextH]);
+    node._widgetSlotsDirty = true;
+    node.setDirtyCanvas?.(true, true);
+
+    setTimeout(() => ensureUploadAreaHeight(node, attempt + 1), 220);
+}
+
+/* 多次 render 只排一次校正，避免并发迭代互相打架 */
+function scheduleUploadAreaFit(node) {
+    if (node.__mmrFitTimer) clearTimeout(node.__mmrFitTimer);
+    node.__mmrFitTimer = setTimeout(() => {
+        node.__mmrFitTimer = null;
+        ensureUploadAreaHeight(node);
+    }, 80);
 }
 
 function createRefSlot(node, slotIndex, fileInfo) {
@@ -634,10 +848,16 @@ function createRefSlot(node, slotIndex, fileInfo) {
         e.stopPropagation();
     });
 
+    // v6.1：已有图片的槽位额外支持「按住拖动改顺序」
+    if (fileInfo?.filename) installSlotReorder(node, slot, slotIndex);
+
     slot.addEventListener("click", (e) => {
         if (e.target.closest(".mmr-ref-slot-remove")) return;
         e.preventDefault();
         e.stopPropagation();
+
+        // 刚做完一次拖拽重排 —— 吃掉这次 click，别弹出文件选择框
+        if (node.__mmrSuppressSlotClick) return;
 
         const fileInput = document.createElement("input");
         fileInput.type = "file";
@@ -3041,6 +3261,61 @@ function installStyles() {
     background: rgba(90, 169, 240, 0.22);
     box-shadow: 0 0 0 2px rgba(90, 169, 240, 0.25);
 }
+/* === v6.1：已上传参考图的拖拽重排 === */
+.mmr-ref-slot.is-reorderable {
+    cursor: grab;
+}
+.mmr-ref-slot.is-reorderable:active {
+    cursor: grabbing;
+}
+/* 被拖走的那一格留个空影子 */
+.mmr-ref-slot.is-reorder-source {
+    border-style: dashed;
+    border-color: rgba(255,255,255,0.18);
+    background: rgba(0,0,0,0.12);
+}
+.mmr-ref-slot.is-reorder-source img {
+    opacity: 0.15;
+}
+/* 松手后图片将落到这一格 */
+.mmr-ref-slot.is-reorder-target {
+    border-style: solid;
+    border-color: #6cb6ff;
+    background: rgba(90, 169, 240, 0.18);
+    box-shadow: 0 0 0 2px rgba(108, 182, 255, 0.55);
+    transform: scale(1.03);
+}
+.mmr-ref-slot.is-reorder-target::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: rgba(108, 182, 255, 0.12);
+    pointer-events: none;
+}
+/* 跟着光标走的浮动缩略图 */
+.mmr-ref-reorder-ghost {
+    position: fixed;
+    z-index: 99999;
+    pointer-events: none;
+    border-radius: 6px;
+    overflow: hidden;
+    opacity: 0.9;
+    box-shadow: 0 8px 22px rgba(0,0,0,0.55);
+    outline: 2px solid rgba(108, 182, 255, 0.9);
+    transform: translateZ(0);
+}
+.mmr-ref-reorder-ghost img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+}
+body.mmr-reordering,
+body.mmr-reordering .mmr-ref-slot,
+body.mmr-reordering .mmr-ref-slot * {
+    cursor: grabbing !important;
+    user-select: none;
+}
 .mmr-ref-slot img {
     width: 100%;
     height: 100%;
@@ -3330,6 +3605,10 @@ function installNode(nodeType, nodeData) {
         if (this.__mmrEditorRetryTimer) {
             clearTimeout(this.__mmrEditorRetryTimer);
             this.__mmrEditorRetryTimer = null;
+        }
+        if (this.__mmrFitTimer) {
+            clearTimeout(this.__mmrFitTimer);
+            this.__mmrFitTimer = null;
         }
         if (syncThrottleMap.has(this)) {
             clearTimeout(syncThrottleMap.get(this));

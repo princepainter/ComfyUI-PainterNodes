@@ -24,6 +24,12 @@ except Exception as e:
     print(f"[PainterNodes] Failed to import PainterVideoCombine: {e}")
 
 try:
+    from . import PainterVideoCombine2
+    _register_module(PainterVideoCombine2)
+except Exception as e:
+    print(f"[PainterNodes] Failed to import PainterVideoCombine2: {e}")
+
+try:
     from . import PainterVideoInfo
     _register_module(PainterVideoInfo)
 except Exception as e:
@@ -165,7 +171,7 @@ except Exception as e:
 
 print(f"\033[92m[PainterNodes] Loaded {len(NODE_CLASS_MAPPINGS)} nodes successfully!\033[0m")
 
-__version__ = "1.4.4"
+__version__ = "1.4.5"
 WEB_DIRECTORY = "./web/js"
 
 __all__ = [

@@ -6,6 +6,9 @@
   3. 前台提示词编辑器中的快捷标识显示与最终输出文本完全一致
      （<Picture 1> / <d>[Chinese] 台词。</d> / [Shot 2] At 00:02.00），仅保留配色高亮，
      方便直接从节点里框选复制出可直接复用的完整提示词。
+  4. v6.1 参考图支持鼠标拖拽重排（前端实现）：按住已上传的缩略图拖到目标槽位
+     松手即可改变顺序；本节点按 ref_image_files 数组顺序编号 <Picture 1..N>，
+     所以重排后编号会自动跟着变（注意提示词里已写死的 <Picture N> 需人工核对）。
 
 Prompt + reference images (uploaded internally) / videos / audio -> conditioning + AV latent.
 Reference tags: <Picture i> / <Video k> / <Audio j>.
@@ -179,7 +182,7 @@ class PainterMiniMaxRefToVideo6(io.ComfyNode):
     def define_schema(cls):
         return io.Schema(
             node_id="PainterMiniMaxRefToVideo6",
-            description="Reference conditioning for MiniMax H3 (v6: internal image upload with drag & drop, WYSIWYG quick tags, no width/height/length outputs). Use <Picture i> / <Video k> / <Audio j> tags when prompting.",
+            description="Reference conditioning for MiniMax H3 (v6: internal image upload with drag & drop and drag-to-reorder, WYSIWYG quick tags, no width/height/length outputs). Use <Picture i> / <Video k> / <Audio j> tags when prompting.",
             display_name="Painter MiniMax Ref To Video 6",
             category="model/conditioning/minimax",
             inputs=[
