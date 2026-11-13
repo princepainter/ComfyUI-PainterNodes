@@ -25,23 +25,22 @@ low-res into a high-res sampling pass means the anchor pixels get resampled by t
 -- the first/last frames come back soft. Re-encoding the frames at the upscaled canvas
 gives the refine pass crisp anchors at exactly the resolution it samples at.
 
-Both patches below are the same runtime fixes v1 needs (they are idempotent, so loading
-this module next to v1 is harmless):
+The runtime patch below is the same gated fix v1 needs (idempotent, so loading this
+module next to v1 is harmless):
 
-Patch 1 (extra_conds overwrite bug):
-  cond_video_latents is shared by the keyframes / refs branches; the refs branch
-  overwrites the keyframes value. An audio-only ref has no "latent" key, which
-  overwrites cond_video_latents with an empty list -> first/last frame latents lost.
-  -> patched to concatenate keyframes + refs.
-
-Patch 2 (PackedLayout position misalignment bug, root cause):
-  keyframes' cond-segment time positions start from text_len (first frame text_len /
-  last frame text_len + video span), but the refs branch pushes cursor by refs_offset
-  (audio pushes ref_audio_t, image pushes 1, video pushes its span), so the target
-  video segment shifts back while the cond segment stays put -> first/last frames and
-  the video are misaligned on the time axis, RoPE positions no longer match, and
-  attention cannot hard-anchor the first/last frames (degrades to "identity only").
-  -> patched to offset the cond segment's time position by refs_offset after __init__.
+Patch (extra_conds overwrite fix, gated + version-guarded):
+  - Older ComfyUI builds let the refs branch overwrite the cond_video_latents built
+    by the keyframes branch (an audio-only ref has no "latent" key -> first/last
+    frame latents lost). The wrapper only fires for conditioning created by THIS
+    node ("painter_kfref_fixed" marker stamped in execute); anything from another
+    node or package passes straight through to the official implementation.
+  - Retires itself automatically on ComfyUI builds whose MiniMaxH3._cond_latents
+    already merges keyframes + refs (current official builds fixed this).
+  - Keyframe blocks without a "latent" field are filtered defensively, matching the
+    refs branch filter.
+  - The old PackedLayout position patch was removed: current ComfyUI offsets the
+    cond segment itself, so that wrapper had become a pure no-op that only risked
+    clashing with other packages' patches.
 
 Tag numbering (reference in prompt):
     <Picture 1> = first frame (if provided)
@@ -58,7 +57,6 @@ import comfy.model_management
 import comfy.nested_tensor
 import comfy.model_base
 import comfy.utils
-import comfy.ldm.minimax.model as minimax_model
 
 from comfy_api.latest import io
 
@@ -99,7 +97,20 @@ def _empty_av_latent(width, height, length, batch_size=1):
     return {"samples": comfy.nested_tensor.NestedTensor((video, audio))}, frame_count
 
 
-# ---------------- Patch 1: extra_conds overwrite bug ----------------
+# --------- Patch: extra_conds overwrite fix (gated + version-guarded) ---------
+# Older ComfyUI builds let the refs branch overwrite the cond_video_latents built by
+# the keyframes branch (an audio-only ref has no "latent" key -> first/last frame
+# latents lost). This wrapper fixes that ONLY for conditioning created by this node:
+# execute() stamps a PAINTER_PATCH_MARKER flag into the conditioning and everything
+# without that flag passes straight through to the official (or another package's)
+# extra_conds untouched -- loading this package no longer changes how other nodes or
+# other H3 packages sample. The wrapper also retires itself on ComfyUI builds whose
+# MiniMaxH3._cond_latents already merges keyframes + refs, and defensively skips
+# keyframe blocks that carry no "latent" field (context blocks injected by third-party
+# H3 chain/continuation packages), matching the refs branch filter.
+PAINTER_PATCH_MARKER = "painter_kfref_fixed"
+
+
 def _apply_extra_conds_patch():
     if not hasattr(comfy.model_base, "MiniMaxH3"):
         print("[PainterMiniMaxFL2VA2] WARNING: MiniMaxH3 not found, extra_conds patch skipped")
@@ -108,62 +119,28 @@ def _apply_extra_conds_patch():
     if getattr(f, "_minimax_kfref_patched", False):
         return
     orig = f
+    official_merges = hasattr(comfy.model_base.MiniMaxH3, "_cond_latents")
 
     def patched_extra_conds(self, **kwargs):
         out = orig(self, **kwargs)
+        if official_merges or not kwargs.get(PAINTER_PATCH_MARKER):
+            return out
         keyframes = kwargs.get("minimax_keyframes")
         refs = kwargs.get("minimax_refs")
         if keyframes and refs:
-            payload = out["minimax_payload"].cond
-            payload["cond_video_latents"] = (
-                [kf["latent"] for kf in keyframes]
-                + [r["latent"] for r in refs if "latent" in r]
-            )
+            payload = getattr(out.get("minimax_payload", None), "cond", None)
+            if payload is not None:
+                payload["cond_video_latents"] = (
+                    [kf["latent"] for kf in keyframes if kf.get("latent") is not None]
+                    + [r["latent"] for r in refs if "latent" in r]
+                )
         return out
 
     patched_extra_conds._minimax_kfref_patched = True
     comfy.model_base.MiniMaxH3.extra_conds = patched_extra_conds
 
 
-# ---------------- Patch 2: PackedLayout position misalignment bug (root cause) ----------------
-def _refs_time_offset(refs):
-    """Recompute how much the PackedLayout refs branch pushes the cursor (must match its internal logic)."""
-    off = 0.0
-    for blk in refs:
-        kind = blk["kind"]
-        if kind == "image":
-            off += 1.0
-        elif kind == "audio":
-            off += float(blk["ref_audio_t"])
-        elif kind in ("video", "video_audio"):
-            off += max(float(blk["ref_audio_t"]), sum(minimax_model._video_t_spans(blk["latent_t"])))
-    return off
-
-
-def _apply_layout_patch():
-    if not hasattr(minimax_model, "PackedLayout"):
-        print("[PainterMiniMaxFL2VA2] WARNING: PackedLayout not found, layout patch skipped")
-        return
-    f = minimax_model.PackedLayout.__init__
-    if getattr(f, "_minimax_kfref_layout_patched", False):
-        return
-    orig = f
-
-    def patched_init(self, *args, **kwargs):
-        # Current ComfyUI's PackedLayout.__init__ already offsets keyframe cond
-        # positions by the refs span (the `cursor += _ref_t_span(blk)` loop runs
-        # before the keyframes block), and its signature no longer accepts frame_count.
-        # So we only forward the caller's arguments verbatim and never add our own
-        # offset -- re-offsetting here would double-shift the first/last frames and
-        # break the hard anchor.
-        orig(self, *args, **kwargs)
-
-    patched_init._minimax_kfref_layout_patched = True
-    minimax_model.PackedLayout.__init__ = patched_init
-
-
 _apply_extra_conds_patch()
-_apply_layout_patch()
 
 
 def _snap_canvas(value, fallback):
@@ -268,7 +245,8 @@ class PainterMiniMaxFL2VA2(io.ComfyNode):
         tokens = clip.tokenize(prompt, minimax_ref_items=ref_items)
         cond = clip.encode_from_tokens_scheduled(tokens)
 
-        values = {}
+        # marker: only conditioning built by this node gets the gated overwrite fix
+        values = {PAINTER_PATCH_MARKER: True}
         if ref_blocks:
             values["minimax_refs"] = ref_blocks
         if keyframes:
@@ -287,7 +265,8 @@ class PainterMiniMaxFL2VA2(io.ComfyNode):
                     "resolved_frame_index": frame_index,
                     "latent": vae.encode(_resize(image, up_width, up_height, crop)),
                 })
-            up_values = {"minimax_keyframes": up_kfs, "minimax_frame_count": frame_count}
+            up_values = {PAINTER_PATCH_MARKER: True,
+                         "minimax_keyframes": up_kfs, "minimax_frame_count": frame_count}
             if ref_blocks:
                 up_values["minimax_refs"] = ref_blocks
             upscale_cond = node_helpers.conditioning_set_values(cond, up_values)
